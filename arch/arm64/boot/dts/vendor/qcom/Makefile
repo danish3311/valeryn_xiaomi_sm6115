@@ -97,10 +97,22 @@ dtb-$(CONFIG_ARCH_LAGOON) += \
 endif
 
 ifeq ($(CONFIG_BUILD_ARM64_DT_OVERLAY),y)
+ifeq ($(CONFIG_BOARD_CITRUS),y)
+        dtbo-$(CONFIG_BOARD_CITRUS) += \
+                citrus-bengal-idp-overlay.dtbo
+
+citrus-bengal-idp-overlay.dtbo-base := bengal.dtb
+else ifeq ($(CONFIG_BOARD_LIME),y)
+        dtbo-$(CONFIG_BOARD_LIME) += \
+                lime-bengal-idp-overlay.dtbo
+
+lime-bengal-idp-overlay.dtbo-base := bengal.dtb
+else
         dtbo-$(CONFIG_ARCH_BENGAL) += \
                 bengal-idp-overlay.dtbo
 
 bengal-idp-overlay.dtbo-base := bengal.dtb
+endif
 else
 dtb-$(CONFIG_ARCH_BENGAL) += \
                 bengal-idp.dtb
