@@ -455,4 +455,28 @@ config ARCH_ZYNQMP
 	help
 	  This enables support for Xilinx ZynqMP Family
 
+config BOARD_XIAOMI
+	bool "Xiaomi Family"
+	help
+	  This enables support for Xiaomi Family devices.
+
+if BOARD_XIAOMI
+config BOARD_XIAOMI_SM6115
+	bool
+	select ARCH_QCOM
+	select ARCH_BENGAL
+
+config BOARD_CITRUS
+	bool "Citrus platform"
+	select BOARD_XIAOMI_SM6115
+	help
+	  This enables support for Xiaomi POCO M3
+
+config BOARD_LIME
+	bool "Lime, Lemon, and Pomelo platform"
+	select BOARD_XIAOMI_SM6115
+	help
+	  This enables support for Xiaomi Redmi Note 9 4G/Redmi 9T/Redmi 9 Power
+endif
+
 endmenu
