@@ -1,0 +1,14 @@
+name: Build Kernel on GitHub Actions
+
+on:
+  workflow_dispatch:
+
+jobs:
+  dummy_job:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Do Nothing
+        run: |
+          echo this workflow does nothing
+          echo use the build-actions branch instead
+          exit 1
