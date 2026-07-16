@@ -2083,7 +2083,7 @@ INCS := -I $(srctree)/$(WLAN_ROOT)/inc \
 		$(WCFG_INC) \
 		$(HIF_INC) \
 		$(CMN_SYS_INC)
-
+INCS += $(HDD_INC)
 ifeq ($(CONFIG_LITHIUM), y)
 INCS += 	$(HAL_INC) \
 		$(DP_INC)
