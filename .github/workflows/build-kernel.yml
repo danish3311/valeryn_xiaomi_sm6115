@@ -1,14 +1,37 @@
 name: Build Kernel on GitHub Actions
-
 on:
   workflow_dispatch:
-
 jobs:
-  dummy_job:
-    runs-on: ubuntu-latest
+  build:
+    runs-on: ubuntu-24.04
     steps:
-      - name: Do Nothing
-        run: |
-          echo this workflow does nothing
-          echo use the build-actions branch instead
-          exit 1
+    - name: Setup tmate session
+      uses: mxschmitt/action-tmate@v3
+      with:
+        detached: true
+
+    - name: Update environment
+      run: sudo apt update -y
+
+    - name: Install Dependencies
+      run: sudo apt install -y git build-essential zip unzip curl
+
+    - name: Get script
+      run: curl -o build_actions.sh -L https://raw.githubusercontent.com/danish3311/valeryn_xiaomi_sm6115/refs/heads/build-actions/build_actions.sh
+
+    - name: Build kernel
+      run: bash build_actions.sh
+
+    - name: List build artifacts
+      run: find . -maxdepth 5 \( -iname "*.zip" -o -iname "*.tar.xz" \)
+      if: always()
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      if: success()
+      with:
+        name: kernel-chime-${{ github.run_id }}
+        path: |
+          4.19*.zip
+          *kernel-prebuilt*.tar.xz
+        if-no-files-found: error
