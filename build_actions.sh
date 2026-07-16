@@ -8,7 +8,7 @@ curl -o build_ksun3.sh -L https://raw.githubusercontent.com/danish3311/valeryn_x
 mkdir build
 cd build
 rm -rf kernel
-git clone --depth 50 --no-single-branch https://github.com kernel
+git clone --depth 50 --no-single-branch https://github.com/danish3311/valeryn_xiaomi_sm6115 kernel
 
 cd kernel || exit 1
 KERNEL_BUILD_DIR=`pwd`
