@@ -23881,7 +23881,7 @@ static int __wlan_hdd_cfg80211_channel_switch(struct wiphy *wiphy,
 	wlan_hdd_set_sap_csa_reason(hdd_ctx->psoc, adapter->vdev_id,
 				    CSA_REASON_USER_INITIATED);
 
-	ch_width = hdd_map_nl_chan_width(csa_params->chandef.width, 0);
+	ch_width = hdd_map_nl_chan_width(csa_params->chandef.width);
 
 	ret =
 	    hdd_softap_set_channel_change(dev,
