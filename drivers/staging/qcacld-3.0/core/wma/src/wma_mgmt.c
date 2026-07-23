@@ -2566,9 +2566,9 @@ static int wma_process_mgmt_tx_completion(tp_wma_handle wma_handle,
 
 			norm_status = status & 0x3;
 			if (!inj_ext_status_logged) {
-				wma_info("Injection: FW extended status 0x%x normalised to %u (%s)",
-					 status, norm_status,
-					 wma_get_status_str(norm_status));
+				wma_debug("Injection: FW extended status 0x%x normalised to %u (%s)",
+					  status, norm_status,
+					  wma_get_status_str(norm_status));
 				inj_ext_status_logged = true;
 			}
 		}

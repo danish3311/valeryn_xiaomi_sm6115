@@ -110,6 +110,37 @@ QDF_STATUS hdd_injection_get_global_config(struct injection_config *config);
  */
 bool hdd_injection_is_globally_enabled(void);
 
+/**
+ * hdd_injection_get_debug_level() - Get current injection debug level
+ *
+ * Shared with WMA so per-frame firmware-path logs honor the same sysfs
+ * /sys/kernel/frame_injection/debug_level gate as HDD-side logs.
+ *
+ * Return: 0=none .. 5=verbose
+ */
+uint8_t hdd_injection_get_debug_level(void);
+
+/**
+ * hdd_injection_note_activity() - Record injection activity timestamp
+ *
+ * Called when a frame is submitted, stats are reset, etc. Used by the
+ * monitor-mode Wi-Fi-off idle timeout (Phase 2).
+ */
+void hdd_injection_note_activity(void);
+
+/**
+ * hdd_injection_monitor_off_idle_expired() - Check monitor-off idle timeout
+ *
+ * Return: true if no injection activity within the configured idle window
+ * (default 120s), meaning a framework Wi-Fi OFF may be allowed through.
+ */
+bool hdd_injection_monitor_off_idle_expired(void);
+
+/**
+ * hdd_injection_get_monitor_off_idle_sec() - Get idle timeout seconds
+ */
+uint32_t hdd_injection_get_monitor_off_idle_sec(void);
+
 /* Convenience macros for different log levels */
 #define hdd_inject_log_error(fmt, args...) \
 	hdd_injection_log_with_level(1, fmt, ##args)
@@ -161,6 +192,25 @@ static inline QDF_STATUS hdd_injection_get_global_config(struct injection_config
 static inline bool hdd_injection_is_globally_enabled(void)
 {
 	return false;
+}
+
+static inline uint8_t hdd_injection_get_debug_level(void)
+{
+	return 0;
+}
+
+static inline void hdd_injection_note_activity(void)
+{
+}
+
+static inline bool hdd_injection_monitor_off_idle_expired(void)
+{
+	return true;
+}
+
+static inline uint32_t hdd_injection_get_monitor_off_idle_sec(void)
+{
+	return 0;
 }
 
 #define hdd_inject_log_error(fmt, args...)   do { } while (0)

@@ -15740,9 +15740,27 @@ static ssize_t wlan_hdd_state_ctrl_param_write(struct file *filp,
 	if (strncmp(buf, wlan_off_str, strlen(wlan_off_str)) == 0) {
 		if (monitor_active &&
 		    !uid_eq(current_euid(), GLOBAL_ROOT_UID)) {
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+			/*
+			 * Phase 2: if injection has been idle past the
+			 * configured timeout, allow framework OFF through so a
+			 * forgotten monitor session cannot pin the radio on
+			 * indefinitely.
+			 */
+			if (hdd_injection_monitor_off_idle_expired()) {
+				hdd_warn("Allowing framework wifi OFF: monitor active but injection idle >= %u s (comm=%s)",
+					 hdd_injection_get_monitor_off_idle_sec(),
+					 current->comm);
+			} else {
+				hdd_warn_rl("Ignoring framework wifi OFF while monitor mode is active (%s)",
+					    current->comm);
+				goto exit;
+			}
+#else
 			hdd_warn_rl("Ignoring framework wifi OFF while monitor mode is active (%s)",
 				    current->comm);
 			goto exit;
+#endif
 		}
 		hdd_info("Wifi turning off from UI\n");
 		hdd_inform_wifi_off();

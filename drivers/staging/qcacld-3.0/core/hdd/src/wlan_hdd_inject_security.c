@@ -64,13 +64,17 @@ struct injection_session {
 };
 
 /**
- * hdd_get_current_time_ms() - Get current time in milliseconds
+ * hdd_get_current_time_us() - Get current time in microseconds
  *
- * Return: Current time in milliseconds
+ * Use QDF log timestamps normalized to microseconds. Comparing raw
+ * qdf_get_log_timestamp() ticks (19.2 MHz on MSM) against a millisecond
+ * window made the rate limiter reset every ~52 us and admit unlimited PPS.
+ *
+ * Return: Current time in microseconds
  */
-static uint64_t hdd_get_current_time_ms(void)
+static uint64_t hdd_get_current_time_us(void)
 {
-	return qdf_get_log_timestamp();
+	return qdf_get_log_timestamp_usecs();
 }
 
 /**
@@ -98,7 +102,7 @@ QDF_STATUS hdd_init_injection_security_ctx(struct injection_security_ctx *securi
 	qdf_mem_zero(&security_ctx->stats, sizeof(security_ctx->stats));
 
 	/* Initialize rate limiting */
-	security_ctx->rate_limit_start_time = hdd_get_current_time_ms();
+	security_ctx->rate_limit_start_time = hdd_get_current_time_us();
 	security_ctx->current_rate_count = 0;
 	security_ctx->last_injection_time = 0;
 
@@ -234,7 +238,7 @@ static QDF_STATUS hdd_create_injection_session(struct injection_security_ctx *se
 	session->session_id = session_id;
 	session->pid = current->pid;
 	session->uid = from_kuid(&init_user_ns, current_uid());
-	session->start_time = hdd_get_current_time_ms();
+	session->start_time = hdd_get_current_time_us();
 	session->frame_count = 0;
 
 	/* Add to active sessions list */
@@ -308,16 +312,30 @@ QDF_STATUS hdd_apply_injection_rate_limit(struct hdd_adapter *adapter)
 	}
 
 	security_ctx = &adapter->injection_ctx->security_ctx;
-	current_time = hdd_get_current_time_ms();
-	max_rate = security_ctx->config.max_frame_rate;
-	window_ms = security_ctx->config.rate_window_ms;
+	current_time = hdd_get_current_time_us();
+	/*
+	 * Prefer live sysfs globals over the adapter init snapshot so
+	 * max_frame_rate / rate_window_ms take effect without reload.
+	 */
+	{
+		struct injection_config live_cfg;
 
-	hdd_security_debug("Applying rate limit: current_time=%llu, max_rate=%u, window=%u",
+		if (QDF_IS_STATUS_SUCCESS(
+			hdd_injection_get_global_config(&live_cfg))) {
+			max_rate = live_cfg.max_frame_rate;
+			window_ms = live_cfg.rate_window_ms;
+		} else {
+			max_rate = security_ctx->config.max_frame_rate;
+			window_ms = security_ctx->config.rate_window_ms;
+		}
+	}
+
+	hdd_security_debug("Applying rate limit: current_time_us=%llu, max_rate=%u, window=%u ms",
 			   current_time, max_rate, window_ms);
 
 	/* Check if we need to reset the rate limiting window */
 	time_diff = current_time - security_ctx->rate_limit_start_time;
-	if (time_diff >= window_ms) {
+	if (time_diff >= ((uint64_t)window_ms * 1000ULL)) {
 		/* Reset rate limiting window */
 		security_ctx->rate_limit_start_time = current_time;
 		security_ctx->current_rate_count = 0;
@@ -362,7 +380,7 @@ void hdd_log_injection_activity(struct hdd_adapter *adapter,
 	}
 
 	security_ctx = &adapter->injection_ctx->security_ctx;
-	current_time = hdd_get_current_time_ms();
+	current_time = hdd_get_current_time_us();
 
 	/* Find or create session */
 	session = hdd_find_injection_session(security_ctx, req->session_id);
@@ -420,8 +438,13 @@ QDF_STATUS hdd_validate_injection_permissions(struct hdd_adapter *adapter,
 
 	security_ctx = &adapter->injection_ctx->security_ctx;
 
-	/* Check if injection is globally enabled */
-	if (!security_ctx->config.injection_enabled) {
+	/*
+	 * Always consult the live sysfs global. The per-adapter
+	 * config.injection_enabled snapshot can be stale across
+	 * global_enable writes (fixed in store, but live check is the
+	 * authoritative source of truth).
+	 */
+	if (!hdd_injection_is_globally_enabled()) {
 		security_ctx->stats.permission_denials++;
 		hdd_security_warn("Frame injection is disabled");
 		return QDF_STATUS_E_PERM;

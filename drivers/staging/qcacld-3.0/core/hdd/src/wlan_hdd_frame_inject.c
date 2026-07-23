@@ -434,8 +434,12 @@ QDF_STATUS hdd_process_frame_injection(struct hdd_adapter *adapter,
 	}
 
 	/*
-	 * Injection currently transmits via WMI mgmt-tx path, so only 802.11
-	 * management frames are supported on this path.
+	 * INTENTIONAL SCOPE LIMIT (do not "fix" without a new TX path):
+	 * Injection transmits via WMI management TX + a hidden STA helper
+	 * vdev. Only 802.11 Management frames (fc_type=0x00) are supported.
+	 * Data (0x08) / Control (0x04) — including EAPOL/WPS used by Reaver —
+	 * are rejected here by design. Full WPS requires a firmware raw-data
+	 * TX path that this chip/stack does not expose.
 	 */
 	frame_type = req->frame_data[0] & 0x0c;
 	if (frame_type != 0x00) {
@@ -471,6 +475,9 @@ QDF_STATUS hdd_process_frame_injection(struct hdd_adapter *adapter,
 	/* Update statistics for successful submission */
 	hdd_update_injection_stats(adapter, HDD_INJECTION_STAT_FRAMES_SUBMITTED, 1);
 
+	/* Refresh idle timer used by monitor-mode Wi-Fi-off escape */
+	hdd_injection_note_activity();
+
 	/* Update throughput monitoring */
 	hdd_update_injection_throughput(adapter);
 
@@ -504,8 +511,7 @@ int hdd_frame_inject_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 	QDF_STATUS status;
 	int ret = 0;
 
-	hdd_inject_info("Frame injection IOCTL called: cmd=0x%x", cmd);
-	printk(KERN_INFO "FRAME_INJECT: ioctl called with cmd=0x%x\n", cmd);
+	hdd_inject_debug("Frame injection IOCTL called: cmd=0x%x", cmd);
 
 	if (!dev || !ifr || !ifr->ifr_data) {
 		hdd_inject_err("Invalid parameters");
@@ -1579,6 +1585,9 @@ QDF_STATUS hdd_reset_injection_stats(struct hdd_adapter *adapter)
 	injection_ctx->security_ctx.last_injection_time = 0;
 	injection_ctx->security_ctx.rate_limit_start_time = 0;
 	injection_ctx->security_ctx.current_rate_count = 0;
+
+	/* Stats reset counts as activity for the monitor-off idle timer */
+	hdd_injection_note_activity();
 
 	hdd_inject_info("Reset injection statistics for adapter %pK", adapter);
 	return QDF_STATUS_SUCCESS;

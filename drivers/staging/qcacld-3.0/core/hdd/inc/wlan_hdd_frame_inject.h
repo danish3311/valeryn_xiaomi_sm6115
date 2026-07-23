@@ -60,6 +60,13 @@ struct wireless_dev;
 /* Rate limiting window in milliseconds */
 #define HDD_FRAME_INJECT_RATE_WINDOW_MS  1000
 
+/*
+ * Idle timeout for the monitor-mode Wi-Fi-off block (Phase 2).
+ * If no injection activity occurs within this many seconds, the framework
+ * OFF request is allowed through even while monitor mode is nominally active.
+ */
+#define HDD_FRAME_INJECT_MONITOR_OFF_IDLE_SEC  120
+
 /* Statistics type constants for hdd_update_injection_stats() */
 #define HDD_INJECTION_STAT_FRAMES_SUBMITTED     0
 #define HDD_INJECTION_STAT_FRAMES_TRANSMITTED   1

@@ -154,6 +154,33 @@ QDF_STATUS wma_deinit_injection_queue(tp_wma_handle wma_handle);
 void wma_injection_pre_stop_cleanup(tp_wma_handle wma_handle);
 
 /**
+ * wma_injection_on_vdev_start_rsp() - Consume start resp for helper vdev
+ * @vdev_id: Firmware vdev id from WMI start response
+ * @fw_status: Firmware status field from the response
+ *
+ * Called from the target_if start-response path before MLME/objmgr lookup.
+ * Returns true if this response belongs to the injection helper (caller must
+ * skip normal MLME handling).
+ */
+bool wma_injection_on_vdev_start_rsp(uint8_t vdev_id, uint32_t fw_status);
+
+/**
+ * wma_injection_on_vdev_stop_rsp() - Consume stop resp for helper vdev
+ * @vdev_id: Firmware vdev id
+ *
+ * Return: true if consumed by injection helper
+ */
+bool wma_injection_on_vdev_stop_rsp(uint8_t vdev_id);
+
+/**
+ * wma_injection_on_vdev_delete_rsp() - Consume delete resp for helper vdev
+ * @vdev_id: Firmware vdev id
+ *
+ * Return: true if consumed by injection helper
+ */
+bool wma_injection_on_vdev_delete_rsp(uint8_t vdev_id);
+
+/**
  * wma_queue_injection_frame() - Queue frame for injection
  * @wma_handle: WMA handle
  * @req: Frame injection request
@@ -339,6 +366,22 @@ static inline QDF_STATUS wma_deinit_injection_queue(tp_wma_handle wma_handle)
 
 static inline void wma_injection_pre_stop_cleanup(tp_wma_handle wma_handle)
 {
+}
+
+static inline bool wma_injection_on_vdev_start_rsp(uint8_t vdev_id,
+						   uint32_t fw_status)
+{
+	return false;
+}
+
+static inline bool wma_injection_on_vdev_stop_rsp(uint8_t vdev_id)
+{
+	return false;
+}
+
+static inline bool wma_injection_on_vdev_delete_rsp(uint8_t vdev_id)
+{
+	return false;
 }
 
 static inline QDF_STATUS wma_queue_injection_frame(tp_wma_handle wma_handle,

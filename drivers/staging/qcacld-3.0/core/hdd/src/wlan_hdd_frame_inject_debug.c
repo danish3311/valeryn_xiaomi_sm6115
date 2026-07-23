@@ -29,6 +29,7 @@
 #include <linux/kobject.h>
 #include <qdf_mem.h>
 #include <qdf_trace.h>
+#include <qdf_time.h>
 
 #ifdef FEATURE_FRAME_INJECTION_SUPPORT
 
@@ -43,11 +44,17 @@
 /* Global debug level */
 static uint8_t g_injection_debug_level = HDD_INJECT_DEBUG_LEVEL_INFO;
 
+static void hdd_injection_sync_global_enable_to_adapters(bool enable);
+
 /* Global configuration parameters */
 static bool g_injection_global_enable = true;
 static uint32_t g_injection_max_frame_rate = HDD_FRAME_INJECT_DEFAULT_RATE_LIMIT;
 static uint32_t g_injection_max_frame_size = HDD_FRAME_INJECT_MAX_SIZE;
 static uint32_t g_injection_max_queue_size = HDD_FRAME_INJECT_MAX_QUEUE_SIZE;
+static uint32_t g_injection_monitor_off_idle_sec =
+	HDD_FRAME_INJECT_MONITOR_OFF_IDLE_SEC;
+/* qdf log timestamp (usecs) of last injection activity; 0 = never */
+static uint64_t g_injection_last_activity_us;
 static uint32_t g_injection_rate_window_ms = HDD_FRAME_INJECT_RATE_WINDOW_MS;
 static bool g_injection_require_monitor_mode = false;
 
@@ -346,8 +353,15 @@ static ssize_t hdd_injection_sysfs_global_enable_store(struct kobject *kobj,
 	}
 
 	g_injection_global_enable = enable;
-	pr_info("Frame injection global enable set to: %s\n", enable ? "true" : "false");
-	
+	/*
+	 * Propagate to already-initialized adapters. Permission checks used to
+	 * read a one-time snapshot from hdd_init_injection_security_ctx();
+	 * without this walk, sysfs global_enable=1 left stale false in place.
+	 */
+	hdd_injection_sync_global_enable_to_adapters(enable);
+	pr_info("Frame injection global enable set to: %s\n",
+		enable ? "true" : "false");
+
 	return count;
 }
 
@@ -490,6 +504,31 @@ static ssize_t hdd_injection_sysfs_require_monitor_mode_store(struct kobject *ko
 	return count;
 }
 
+static ssize_t hdd_injection_sysfs_monitor_off_idle_sec_show(struct kobject *kobj,
+							    struct kobj_attribute *attr,
+							    char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%u\n", g_injection_monitor_off_idle_sec);
+}
+
+static ssize_t hdd_injection_sysfs_monitor_off_idle_sec_store(struct kobject *kobj,
+							     struct kobj_attribute *attr,
+							     const char *buf,
+							     size_t count)
+{
+	uint32_t sec;
+	int ret;
+
+	ret = kstrtou32(buf, 10, &sec);
+	if (ret)
+		return ret;
+
+	/* 0 disables the idle escape (block OFF indefinitely while monitor) */
+	g_injection_monitor_off_idle_sec = sec;
+	pr_info("Frame injection monitor_off_idle_sec set to %u\n", sec);
+	return count;
+}
+
 /* Sysfs attributes */
 static struct kobj_attribute hdd_injection_debug_level_attr =
 	__ATTR(debug_level, 0644, hdd_injection_sysfs_debug_level_show,
@@ -519,6 +558,11 @@ static struct kobj_attribute hdd_injection_require_monitor_mode_attr =
 	__ATTR(require_monitor_mode, 0644, hdd_injection_sysfs_require_monitor_mode_show,
 	       hdd_injection_sysfs_require_monitor_mode_store);
 
+static struct kobj_attribute hdd_injection_monitor_off_idle_sec_attr =
+	__ATTR(monitor_off_idle_sec, 0644,
+	       hdd_injection_sysfs_monitor_off_idle_sec_show,
+	       hdd_injection_sysfs_monitor_off_idle_sec_store);
+
 static struct attribute *hdd_injection_sysfs_attrs[] = {
 	&hdd_injection_debug_level_attr.attr,
 	&hdd_injection_global_enable_attr.attr,
@@ -527,6 +571,7 @@ static struct attribute *hdd_injection_sysfs_attrs[] = {
 	&hdd_injection_max_queue_size_attr.attr,
 	&hdd_injection_rate_window_ms_attr.attr,
 	&hdd_injection_require_monitor_mode_attr.attr,
+	&hdd_injection_monitor_off_idle_sec_attr.attr,
 	NULL,
 };
 
@@ -752,6 +797,66 @@ QDF_STATUS hdd_injection_get_global_config(struct injection_config *config)
 bool hdd_injection_is_globally_enabled(void)
 {
 	return g_injection_global_enable;
+}
+
+uint8_t hdd_injection_get_debug_level(void)
+{
+	return g_injection_debug_level;
+}
+
+void hdd_injection_note_activity(void)
+{
+	g_injection_last_activity_us = qdf_get_log_timestamp_usecs();
+}
+
+uint32_t hdd_injection_get_monitor_off_idle_sec(void)
+{
+	return g_injection_monitor_off_idle_sec;
+}
+
+bool hdd_injection_monitor_off_idle_expired(void)
+{
+	uint64_t now_us, idle_us;
+
+	/* 0 = idle escape disabled: never expire */
+	if (!g_injection_monitor_off_idle_sec)
+		return false;
+
+	/* No activity recorded yet — treat as idle so OFF is not stuck forever */
+	if (!g_injection_last_activity_us)
+		return true;
+
+	now_us = qdf_get_log_timestamp_usecs();
+	if (now_us < g_injection_last_activity_us)
+		return true;
+
+	idle_us = now_us - g_injection_last_activity_us;
+	return idle_us >= ((uint64_t)g_injection_monitor_off_idle_sec * 1000000ULL);
+}
+
+static QDF_STATUS hdd_injection_sync_enable_cb(struct hdd_adapter *adapter,
+					       void *context)
+{
+	bool enable = *((bool *)context);
+
+	if (adapter && adapter->injection_ctx)
+		adapter->injection_ctx->security_ctx.config.injection_enabled =
+			enable;
+
+	return QDF_STATUS_SUCCESS;
+}
+
+/**
+ * hdd_injection_sync_global_enable_to_adapters() - Push global_enable live
+ * @enable: New global enable value
+ *
+ * security_ctx->config.injection_enabled is snapshotted at adapter init.
+ * Sysfs writes must update already-open adapters or permission checks keep
+ * using a stale false until rmmod/modprobe.
+ */
+static void hdd_injection_sync_global_enable_to_adapters(bool enable)
+{
+	hdd_adapter_iterate(hdd_injection_sync_enable_cb, &enable);
 }
 
 #endif /* FEATURE_FRAME_INJECTION_SUPPORT */

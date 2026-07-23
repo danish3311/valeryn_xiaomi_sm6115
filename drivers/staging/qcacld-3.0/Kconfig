@@ -17,4 +17,14 @@ config QCA_CLD_WLAN_PROFILE
 
 	  Profiles are located at drivers/staging/qcacld-3.0/configs.
 
+config FEATURE_FRAME_INJECTION_TEST
+	bool "Build qcacld-3.0 frame injection unit/integration tests"
+	depends on QCA_CLD_WLAN
+	default n
+	help
+	  Compile the FRAME_INJECTION *_test.c / *_comprehensive_test.c /
+	  *_security_test.c / integration helpers into the WLAN driver.
+	  Disabled by default; production NetHunter builds should leave
+	  this off. Enable only for on-target driver self-tests.
+
 endif # QCA_CLD_WLAN

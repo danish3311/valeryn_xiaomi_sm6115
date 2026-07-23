@@ -233,6 +233,17 @@ void target_if_vdev_mgr_rsp_timer_mgmt_cb(void *arg)
 #define VDEV_RSP_RX_CTX WMI_RX_UMAC_CTX
 #endif
 
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+/*
+ * Injection helper STA vdev is firmware-only (no objmgr/MLME). Its start /
+ * stop / delete responses must be consumed here before the normal path
+ * looks up an objmgr vdev or requires a started rsp timer.
+ */
+bool wma_injection_on_vdev_start_rsp(uint8_t vdev_id, uint32_t fw_status);
+bool wma_injection_on_vdev_stop_rsp(uint8_t vdev_id);
+bool wma_injection_on_vdev_delete_rsp(uint8_t vdev_id);
+#endif
+
 static int target_if_vdev_mgr_start_response_handler(ol_scn_t scn,
 						     uint8_t *data,
 						     uint32_t datalen)
@@ -275,6 +286,10 @@ static int target_if_vdev_mgr_start_response_handler(ol_scn_t scn,
 	}
 
 	vdev_id = vdev_start_resp.vdev_id;
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+	if (wma_injection_on_vdev_start_rsp(vdev_id, vdev_start_resp.status))
+		return 0;
+#endif
 	vdev_rsp = rx_ops->psoc_get_vdev_response_timer_info(psoc, vdev_id);
 	if (!vdev_rsp) {
 		mlme_err("vdev response timer is null VDEV_%d PSOC_%d",
@@ -353,6 +368,11 @@ static int target_if_vdev_mgr_stop_response_handler(ol_scn_t scn,
 		return -EINVAL;
 	}
 
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+	if (wma_injection_on_vdev_stop_rsp((uint8_t)vdev_id))
+		return 0;
+#endif
+
 	vdev_rsp = rx_ops->psoc_get_vdev_response_timer_info(psoc, vdev_id);
 	if (!vdev_rsp) {
 		mlme_err("vdev response timer is null VDEV_%d PSOC_%d",
@@ -415,6 +435,11 @@ static int target_if_vdev_mgr_delete_response_handler(ol_scn_t scn,
 		mlme_err("WMI extract failed");
 		return -EINVAL;
 	}
+
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+	if (wma_injection_on_vdev_delete_rsp(vdev_del_resp.vdev_id))
+		return 0;
+#endif
 
 	vdev_rsp = rx_ops->psoc_get_vdev_response_timer_info(psoc,
 							 vdev_del_resp.vdev_id);
