@@ -16200,8 +16200,16 @@ static QDF_STATUS hdd_qdf_init(void)
 
 	status = qdf_debugfs_init();
 	if (QDF_IS_STATUS_ERROR(status)) {
-		hdd_err("Failed to init debugfs; status:%u", status);
-		goto print_deinit;
+		/*
+		 * debugfs is optional. When the kernel is built without
+		 * CONFIG_DEBUG_FS (common on vendor perf builds that merge
+		 * debugfs.config with CONFIG_DEBUG_FS=n), create_dir fails
+		 * and used to abort the entire WLAN driver load — leaving
+		 * the device with no wlan0. Continue without debugfs.
+		 */
+		hdd_warn("Failed to init debugfs; status:%u (continuing without debugfs)",
+			 status);
+		status = QDF_STATUS_SUCCESS;
 	}
 
 	qdf_lock_stats_init();

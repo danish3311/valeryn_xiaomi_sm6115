@@ -39,8 +39,10 @@ QDF_STATUS qdf_debugfs_init(void)
 {
 	qdf_debugfs_root = debugfs_create_dir(KBUILD_MODNAME, NULL);
 
-	if (!qdf_debugfs_root)
+	if (!qdf_debugfs_root || IS_ERR(qdf_debugfs_root)) {
+		qdf_debugfs_root = NULL;
 		return QDF_STATUS_E_FAILURE;
+	}
 
 	return QDF_STATUS_SUCCESS;
 }
