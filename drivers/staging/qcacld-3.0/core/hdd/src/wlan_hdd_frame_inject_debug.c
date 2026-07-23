@@ -24,7 +24,6 @@
 
 #include "wlan_hdd_includes.h"
 #include "wlan_hdd_frame_inject.h"
-#include <linux/debugfs.h>
 #include <linux/sysfs.h>
 #include <linux/kobject.h>
 #include <qdf_mem.h>
@@ -58,217 +57,9 @@ static uint64_t g_injection_last_activity_us;
 static uint32_t g_injection_rate_window_ms = HDD_FRAME_INJECT_RATE_WINDOW_MS;
 static bool g_injection_require_monitor_mode = false;
 
-/* Debugfs root directory */
-static struct dentry *g_injection_debugfs_root = NULL;
-
 /* Sysfs kobject */
 static struct kobject *g_injection_sysfs_kobj = NULL;
 
-/**
- * hdd_injection_debugfs_stats_show() - Show injection statistics in debugfs
- * @file: File pointer
- * @buf: User buffer
- * @count: Buffer size
- * @ppos: File position
- *
- * This function displays injection statistics in debugfs.
- *
- * Return: Number of bytes read, or error code
- */
-static ssize_t hdd_injection_debugfs_stats_show(struct file *file,
-						 char __user *buf,
-						 size_t count,
-						 loff_t *ppos)
-{
-	struct hdd_adapter *adapter = file->private_data;
-	struct hdd_injection_ctx *injection_ctx;
-	struct injection_stats *stats;
-	char *debug_buf;
-	int len = 0;
-	ssize_t ret;
-
-	if (!adapter || !adapter->injection_ctx) {
-		return -EINVAL;
-	}
-
-	injection_ctx = adapter->injection_ctx;
-	stats = &injection_ctx->security_ctx.stats;
-
-	debug_buf = qdf_mem_malloc(2048);
-	if (!debug_buf) {
-		return -ENOMEM;
-	}
-
-	len += scnprintf(debug_buf + len, 2048 - len,
-			 "Frame Injection Statistics for %s:\n", adapter->dev->name);
-	len += scnprintf(debug_buf + len, 2048 - len,
-			 "================================\n");
-	len += scnprintf(debug_buf + len, 2048 - len,
-			 "Frames Submitted:     %llu\n", stats->frames_submitted);
-	len += scnprintf(debug_buf + len, 2048 - len,
-			 "Frames Transmitted:   %llu\n", stats->frames_transmitted);
-	len += scnprintf(debug_buf + len, 2048 - len,
-			 "Frames Dropped:       %llu\n", stats->frames_dropped);
-	len += scnprintf(debug_buf + len, 2048 - len,
-			 "Validation Failures:  %llu\n", stats->validation_failures);
-	len += scnprintf(debug_buf + len, 2048 - len,
-			 "Permission Denials:   %llu\n", stats->permission_denials);
-	len += scnprintf(debug_buf + len, 2048 - len,
-			 "Rate Limit Hits:      %llu\n", stats->rate_limit_hits);
-	len += scnprintf(debug_buf + len, 2048 - len,
-			 "Queue Overflows:      %llu\n", stats->queue_overflows);
-	len += scnprintf(debug_buf + len, 2048 - len,
-			 "Firmware Errors:      %llu\n", stats->firmware_errors);
-	len += scnprintf(debug_buf + len, 2048 - len,
-			 "Last Inject Time:     %llu\n", stats->last_inject_time);
-	len += scnprintf(debug_buf + len, 2048 - len,
-			 "Total Inject Time:    %llu us\n", stats->total_inject_time);
-
-	/* Add recovery context information */
-	len += scnprintf(debug_buf + len, 2048 - len,
-			 "\nError Recovery Information:\n");
-	len += scnprintf(debug_buf + len, 2048 - len,
-			 "Recovery In Progress: %s\n",
-			 injection_ctx->recovery_ctx.recovery_in_progress ? "Yes" : "No");
-	len += scnprintf(debug_buf + len, 2048 - len,
-			 "Recovery Attempts:    %u\n",
-			 injection_ctx->recovery_ctx.recovery_attempts);
-	len += scnprintf(debug_buf + len, 2048 - len,
-			 "Consecutive Errors:   %u\n",
-			 injection_ctx->recovery_ctx.consecutive_errors);
-	len += scnprintf(debug_buf + len, 2048 - len,
-			 "Last Error Type:      %d\n",
-			 injection_ctx->recovery_ctx.last_error.error_type);
-	len += scnprintf(debug_buf + len, 2048 - len,
-			 "Last Error Code:      %d\n",
-			 injection_ctx->recovery_ctx.last_error.error_code);
-	len += scnprintf(debug_buf + len, 2048 - len,
-			 "Last Error Time:      %llu\n",
-			 injection_ctx->recovery_ctx.last_error.timestamp);
-	len += scnprintf(debug_buf + len, 2048 - len,
-			 "Last Error Desc:      %s\n",
-			 injection_ctx->recovery_ctx.last_error.description);
-
-	ret = simple_read_from_buffer(buf, count, ppos, debug_buf, len);
-	qdf_mem_free(debug_buf);
-
-	return ret;
-}
-
-/**
- * hdd_injection_debugfs_config_show() - Show injection configuration in debugfs
- * @file: File pointer
- * @buf: User buffer
- * @count: Buffer size
- * @ppos: File position
- *
- * This function displays injection configuration in debugfs.
- *
- * Return: Number of bytes read, or error code
- */
-static ssize_t hdd_injection_debugfs_config_show(struct file *file,
-						  char __user *buf,
-						  size_t count,
-						  loff_t *ppos)
-{
-	struct hdd_adapter *adapter = file->private_data;
-	struct hdd_injection_ctx *injection_ctx;
-	struct injection_config *config;
-	char *debug_buf;
-	int len = 0;
-	ssize_t ret;
-
-	if (!adapter || !adapter->injection_ctx) {
-		return -EINVAL;
-	}
-
-	injection_ctx = adapter->injection_ctx;
-	config = &injection_ctx->security_ctx.config;
-
-	debug_buf = qdf_mem_malloc(1024);
-	if (!debug_buf) {
-		return -ENOMEM;
-	}
-
-	len += scnprintf(debug_buf + len, 1024 - len,
-			 "Frame Injection Configuration for %s:\n", adapter->dev->name);
-	len += scnprintf(debug_buf + len, 1024 - len,
-			 "=====================================\n");
-	len += scnprintf(debug_buf + len, 1024 - len,
-			 "Injection Enabled:    %s\n", config->injection_enabled ? "Yes" : "No");
-	len += scnprintf(debug_buf + len, 1024 - len,
-			 "Max Frame Rate:       %u fps\n", config->max_frame_rate);
-	len += scnprintf(debug_buf + len, 1024 - len,
-			 "Max Frame Size:       %u bytes\n", config->max_frame_size);
-	len += scnprintf(debug_buf + len, 1024 - len,
-			 "Max Queue Size:       %u frames\n", config->max_queue_size);
-	len += scnprintf(debug_buf + len, 1024 - len,
-			 "Rate Window:          %u ms\n", config->rate_window_ms);
-	len += scnprintf(debug_buf + len, 1024 - len,
-			 "Require Monitor Mode: %s\n", config->require_monitor_mode ? "Yes" : "No");
-	len += scnprintf(debug_buf + len, 1024 - len,
-			 "Log Level:            %u\n", config->log_level);
-	len += scnprintf(debug_buf + len, 1024 - len,
-			 "Monitor Mode Active:  %s\n", injection_ctx->is_monitor_mode ? "Yes" : "No");
-	len += scnprintf(debug_buf + len, 1024 - len,
-			 "Current Queue Size:   %u frames\n",
-			 qdf_list_size(&injection_ctx->injection_queue));
-
-	ret = simple_read_from_buffer(buf, count, ppos, debug_buf, len);
-	qdf_mem_free(debug_buf);
-
-	return ret;
-}
-
-/**
- * hdd_injection_debugfs_reset_write() - Reset injection statistics via debugfs
- * @file: File pointer
- * @buf: User buffer
- * @count: Buffer size
- * @ppos: File position
- *
- * This function resets injection statistics when written to.
- *
- * Return: Number of bytes written, or error code
- */
-static ssize_t hdd_injection_debugfs_reset_write(struct file *file,
-						  const char __user *buf,
-						  size_t count,
-						  loff_t *ppos)
-{
-	struct hdd_adapter *adapter = file->private_data;
-	QDF_STATUS status;
-
-	if (!adapter || !adapter->injection_ctx) {
-		return -EINVAL;
-	}
-
-	status = hdd_reset_injection_stats(adapter);
-	if (QDF_IS_STATUS_ERROR(status)) {
-		return -EIO;
-	}
-
-	return count;
-}
-
-/* Debugfs file operations */
-static const struct file_operations hdd_injection_debugfs_stats_fops = {
-	.open = simple_open,
-	.read = hdd_injection_debugfs_stats_show,
-	.llseek = default_llseek,
-};
-
-static const struct file_operations hdd_injection_debugfs_config_fops = {
-	.open = simple_open,
-	.read = hdd_injection_debugfs_config_show,
-	.llseek = default_llseek,
-};
-
-static const struct file_operations hdd_injection_debugfs_reset_fops = {
-	.open = simple_open,
-	.write = hdd_injection_debugfs_reset_write,
-	.llseek = default_llseek,
-};
 
 /**
  * hdd_injection_sysfs_debug_level_show() - Show debug level via sysfs
@@ -580,79 +371,30 @@ static struct attribute_group hdd_injection_sysfs_attr_group = {
 };
 
 /**
- * hdd_injection_create_debugfs_entries() - Create debugfs entries for adapter
+ * hdd_injection_create_debugfs_entries() - stub (debugfs unused)
  * @adapter: HDD adapter
  *
- * This function creates debugfs entries for frame injection debugging.
- *
- * Return: QDF_STATUS_SUCCESS on success, error code on failure
+ * Injection controls live under /sys/kernel/frame_injection (sysfs).
+ * Return: QDF_STATUS_SUCCESS
  */
 QDF_STATUS hdd_injection_create_debugfs_entries(struct hdd_adapter *adapter)
 {
-	struct dentry *adapter_dir;
-	char dir_name[32];
-
-	if (!adapter || !g_injection_debugfs_root) {
-		return QDF_STATUS_E_INVAL;
-	}
-
-	/* Create adapter-specific directory */
-	snprintf(dir_name, sizeof(dir_name), "%s", adapter->dev->name);
-	adapter_dir = debugfs_create_dir(dir_name, g_injection_debugfs_root);
-	if (IS_ERR_OR_NULL(adapter_dir)) {
-		hdd_warn("Failed to create debugfs directory for %s", adapter->dev->name);
-		return QDF_STATUS_E_FAILURE;
-	}
-
-	/* Create statistics file */
-	debugfs_create_file("stats", 0444, adapter_dir, adapter,
-			    &hdd_injection_debugfs_stats_fops);
-
-	/* Create configuration file */
-	debugfs_create_file("config", 0444, adapter_dir, adapter,
-			    &hdd_injection_debugfs_config_fops);
-
-	/* Create reset file */
-	debugfs_create_file("reset", 0200, adapter_dir, adapter,
-			    &hdd_injection_debugfs_reset_fops);
-
-	/* Store directory pointer in adapter context for cleanup */
-	if (adapter->injection_ctx) {
-		adapter->injection_ctx->debugfs_dir = adapter_dir;
-		hdd_info("Created debugfs entries for %s", adapter->dev->name);
-	}
-
 	return QDF_STATUS_SUCCESS;
 }
 
 /**
- * hdd_injection_remove_debugfs_entries() - Remove debugfs entries for adapter
+ * hdd_injection_remove_debugfs_entries() - stub (debugfs unused)
  * @adapter: HDD adapter
  *
- * This function removes debugfs entries for frame injection debugging.
- *
- * Return: QDF_STATUS_SUCCESS on success, error code on failure
+ * Return: QDF_STATUS_SUCCESS
  */
 QDF_STATUS hdd_injection_remove_debugfs_entries(struct hdd_adapter *adapter)
 {
-	if (!adapter) {
-		return QDF_STATUS_E_INVAL;
-	}
-
-	/* Remove adapter-specific directory using stored pointer */
-	if (adapter->injection_ctx && adapter->injection_ctx->debugfs_dir) {
-		debugfs_remove_recursive(adapter->injection_ctx->debugfs_dir);
-		adapter->injection_ctx->debugfs_dir = NULL;
-		hdd_info("Removed debugfs entries for %s", adapter->dev->name);
-	}
-
 	return QDF_STATUS_SUCCESS;
 }
 
 /**
- * hdd_injection_init_debug_interfaces() - Initialize debug interfaces
- *
- * This function initializes debugfs and sysfs interfaces for frame injection.
+ * hdd_injection_init_debug_interfaces() - Initialize sysfs for frame injection
  *
  * Return: QDF_STATUS_SUCCESS on success, error code on failure
  */
@@ -660,46 +402,32 @@ QDF_STATUS hdd_injection_init_debug_interfaces(void)
 {
 	int ret;
 
-	/* Create debugfs root directory */
-	g_injection_debugfs_root = debugfs_create_dir("frame_injection", NULL);
-	if (IS_ERR_OR_NULL(g_injection_debugfs_root)) {
-		hdd_warn("Failed to create frame injection debugfs root");
-		g_injection_debugfs_root = NULL;
-		/* Continue without debugfs - not critical */
-	}
-
-	/* Create sysfs kobject */
+	/* Sysfs only — debugfs path removed (always failed / unused) */
 	g_injection_sysfs_kobj = kobject_create_and_add("frame_injection",
 							 kernel_kobj);
 	if (!g_injection_sysfs_kobj) {
 		hdd_warn("Failed to create frame injection sysfs kobject");
-		/* Continue without sysfs - not critical */
 	} else {
-		/* Create sysfs attribute group */
 		ret = sysfs_create_group(g_injection_sysfs_kobj,
 					 &hdd_injection_sysfs_attr_group);
 		if (ret) {
 			hdd_warn("Failed to create sysfs attribute group: %d", ret);
 			kobject_put(g_injection_sysfs_kobj);
 			g_injection_sysfs_kobj = NULL;
-			/* Continue without sysfs - not critical */
 		}
 	}
 
-	hdd_info("Frame injection debug interfaces initialized");
+	hdd_info("Frame injection sysfs interfaces initialized");
 	return QDF_STATUS_SUCCESS;
 }
 
 /**
- * hdd_injection_deinit_debug_interfaces() - Deinitialize debug interfaces
- *
- * This function cleans up debugfs and sysfs interfaces for frame injection.
+ * hdd_injection_deinit_debug_interfaces() - Deinitialize sysfs interfaces
  *
  * Return: QDF_STATUS_SUCCESS on success, error code on failure
  */
 QDF_STATUS hdd_injection_deinit_debug_interfaces(void)
 {
-	/* Remove sysfs interfaces */
 	if (g_injection_sysfs_kobj) {
 		sysfs_remove_group(g_injection_sysfs_kobj,
 				   &hdd_injection_sysfs_attr_group);
@@ -707,13 +435,7 @@ QDF_STATUS hdd_injection_deinit_debug_interfaces(void)
 		g_injection_sysfs_kobj = NULL;
 	}
 
-	/* Remove debugfs interfaces */
-	if (g_injection_debugfs_root) {
-		debugfs_remove_recursive(g_injection_debugfs_root);
-		g_injection_debugfs_root = NULL;
-	}
-
-	hdd_info("Frame injection debug interfaces deinitialized");
+	hdd_info("Frame injection sysfs interfaces deinitialized");
 	return QDF_STATUS_SUCCESS;
 }
 

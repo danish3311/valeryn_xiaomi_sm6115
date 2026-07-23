@@ -157,13 +157,6 @@ QDF_STATUS hdd_init_frame_injection(struct hdd_adapter *adapter)
 	/* Assign to adapter */
 	adapter->injection_ctx = injection_ctx;
 
-	/* Create debugfs entries for this adapter */
-	status = hdd_injection_create_debugfs_entries(adapter);
-	if (QDF_IS_STATUS_ERROR(status)) {
-		hdd_inject_warn("Failed to create debugfs entries: %d", status);
-		/* Don't fail initialization for debug interface failure */
-	}
-
 	hdd_inject_info("Frame injection initialized successfully for adapter %pK", adapter);
 	return QDF_STATUS_SUCCESS;
 }
@@ -191,9 +184,6 @@ QDF_STATUS hdd_deinit_frame_injection(struct hdd_adapter *adapter)
 	}
 
 	injection_ctx = adapter->injection_ctx;
-
-	/* Remove debugfs entries for this adapter */
-	hdd_injection_remove_debugfs_entries(adapter);
 
 	/* Cancel any pending work */
 	qdf_cancel_work(&injection_ctx->queue_work);
