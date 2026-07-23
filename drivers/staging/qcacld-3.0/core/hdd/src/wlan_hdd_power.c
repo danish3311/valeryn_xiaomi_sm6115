@@ -80,6 +80,7 @@
 #include <wlan_cfg80211_mc_cp_stats.h>
 #include "wlan_p2p_ucfg_api.h"
 #include "wlan_mlme_ucfg_api.h"
+#include "cfg_mlme_power.h"
 #include "wlan_osif_request_manager.h"
 #include <wlan_hdd_sar_limits.h>
 #include "wlan_hdd_thermal.h"
@@ -2532,6 +2533,39 @@ complete:
 #endif
 
 /**
+ * hdd_txpower_fallback_dbm() - Best-effort TX power when FW stats are empty
+ * @hdd_ctx: HDD context
+ * @adapter: adapter
+ * @dbm: output dBm
+ *
+ * Many qcacld targets return 0 from CP-stats TX power. Prefer cached class-A
+ * max_pwr, then the MLME current_tx_power_level (updated by set_txpower /
+ * INI default, typically 27 dBm).
+ */
+static void hdd_txpower_fallback_dbm(struct hdd_context *hdd_ctx,
+				     struct hdd_adapter *adapter,
+				     int *dbm)
+{
+	uint8_t mlme_dbm = 0;
+	int8_t cached = adapter->hdd_stats.class_a_stat.max_pwr;
+
+	if (cached > 0) {
+		*dbm = cached;
+		return;
+	}
+
+	if (QDF_IS_STATUS_SUCCESS(
+		ucfg_mlme_get_current_tx_power_level(hdd_ctx->psoc,
+						     &mlme_dbm)) &&
+	    mlme_dbm > 0) {
+		*dbm = mlme_dbm;
+		return;
+	}
+
+	*dbm = cfg_default(CFG_CURRENT_TX_POWER_LEVEL);
+}
+
+/**
  * __wlan_hdd_cfg80211_get_txpower() - get TX power
  * @wiphy: Pointer to wiphy
  * @wdev: Pointer to network device
@@ -2550,6 +2584,7 @@ static int __wlan_hdd_cfg80211_get_txpower(struct wiphy *wiphy,
 	int status;
 	struct hdd_station_ctx *sta_ctx;
 	static bool is_rate_limited;
+	bool can_query_fw = false;
 
 	hdd_enter_dev(ndev);
 
@@ -2576,31 +2611,27 @@ static int __wlan_hdd_cfg80211_get_txpower(struct wiphy *wiphy,
 			hdd_debug("Roaming is in progress, rej this req");
 			return -EINVAL;
 		}
-		if (sta_ctx->conn_info.conn_state !=
-		    eConnectionState_Associated) {
-			hdd_debug("Not associated");
-			return 0;
-		}
+		if (sta_ctx->conn_info.conn_state ==
+		    eConnectionState_Associated)
+			can_query_fw = true;
 		break;
 	case QDF_SAP_MODE:
 	case QDF_P2P_GO_MODE:
-		if (!test_bit(SOFTAP_BSS_STARTED, &adapter->event_flags)) {
-			hdd_debug("SAP is not started yet");
-			return 0;
-		}
+		if (test_bit(SOFTAP_BSS_STARTED, &adapter->event_flags))
+			can_query_fw = true;
 		break;
 	default:
-		hdd_debug_rl("Current interface is not supported for get tx_power");
-		return 0;
+		/* Monitor / other modes: FW CP-stats often unsupported */
+		break;
 	}
 
 	HDD_IS_RATE_LIMIT_REQ(is_rate_limited,
 			      hdd_ctx->config->nb_commands_interval);
-	if (hdd_ctx->driver_status != DRIVER_MODULES_ENABLED ||
+	if (!can_query_fw ||
+	    hdd_ctx->driver_status != DRIVER_MODULES_ENABLED ||
 	    is_rate_limited) {
-		hdd_debug("Modules not enabled/rate limited, use cached stats");
-		/* Send cached data to upperlayer*/
-		*dbm = adapter->hdd_stats.class_a_stat.max_pwr;
+		hdd_txpower_fallback_dbm(hdd_ctx, adapter, dbm);
+		hdd_debug("txpower fallback (no fw query): %d", *dbm);
 		return 0;
 	}
 
@@ -2609,6 +2640,13 @@ static int __wlan_hdd_cfg80211_get_txpower(struct wiphy *wiphy,
 		   adapter->vdev_id, adapter->device_mode);
 
 	wlan_hdd_get_tx_power(adapter, dbm);
+	/*
+	 * SM6115 / many qcacld FW builds leave CP-stats TX power at 0.
+	 * Fall back so iw/cfg80211 show the configured/limit value instead.
+	 */
+	if (*dbm <= 0)
+		hdd_txpower_fallback_dbm(hdd_ctx, adapter, dbm);
+
 	hdd_debug("power: %d", *dbm);
 
 	return 0;
