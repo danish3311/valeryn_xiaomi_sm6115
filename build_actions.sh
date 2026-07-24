@@ -3,7 +3,7 @@
 
 set -x
 
-curl -o build_ksun3.sh -L https://raw.githubusercontent.com/danish3311/valeryn_xiaomi_sm6115/refs/heads/build-actions/build_ksun3.sh || exit 1
+curl -o build_ksun3.sh -L https://raw.githubusercontent.com/danish3311/valeryn_xiaomi_sm6115/refs/heads/build-actions/build_ksun3-3.sh || exit 1
 
 mkdir build
 cd build
