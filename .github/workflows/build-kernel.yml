@@ -1,15 +1,14 @@
 name: Build Kernel on GitHub Actions
+
 on:
   workflow_dispatch:
+
 jobs:
   build:
     runs-on: ubuntu-24.04
     steps:
-    - name: Setup tmate session
-      uses: mxschmitt/action-tmate@v3
-      with:
-        detached: true
-
+    # REMOVE the tmate step entirely - it's blocking your build
+    
     - name: Update environment
       run: sudo apt update -y
 
