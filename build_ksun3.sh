@@ -33,8 +33,8 @@ KSU_BRANCH="dev-susfs"
 set -x
 
 # Setup tools
-curl -o toolchain.tar.xz -L https://github.com/Joe7500/Builds/releases/download/Stuff/toolchain.tar.xz || exit 1
-curl -o AnyKernel3.tar.xz -L https://github.com/Joe7500/Builds/releases/download/Stuff/AnyKernel3.tar.xz || exit 1
+curl -o toolchain.tar.xz -L https://github.com/danish3311/Builds/releases/download/Stuff/toolchain.tar.xz || exit 1
+curl -o AnyKernel3.tar.xz -L https://github.com/danish3311/Builds/releases/download/Stuff/AnyKernel3.tar.xz || exit 1
 rm -rf toolchain prebuilts
 tar xf toolchain.tar.xz || exit 1
 ln -s prebuilts/clang/host/linux-x86/clang-stablekern/ toolchain
