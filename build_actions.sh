@@ -20,33 +20,6 @@ cd build/kernel || exit 1
 git config user.email "user@localhost"
 git config user.name "user"
 
-# vanilla
-rm -rf *
-git reset --hard
-git switch android16
-git switch -c build-vanilla || exit 1
-bash  ../../build_vanilla.sh 
-if [ $? -eq 0 ] ; then
-   cp 4.19*.zip ../../4.19-A16-valeryn-`date +'%d.%m.%y-%H%M'`.zip
-else
-   echo FAILED
-   exit 1
-fi
-
-# ksun1
-rm -rf *
-git reset --hard
-git switch android16
-git switch -c build-ksun1 || exit 1
-bash ../../build_ksun1.sh
-if [ $? -eq 0 ] ; then
-   cp 4.19*.zip ../../4.19-A16-valeryn-ksun-1.1.1-`date +'%d.%m.%y-%H%M'`.zip
-   cp kernel-prebuilt*.tar.xz ../../
-else
-   echo FAILED
-   exit 1
-fi
-
 # ksun3
 rm -rf *
 git reset --hard
