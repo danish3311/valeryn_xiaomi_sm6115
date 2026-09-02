@@ -199,6 +199,139 @@ if [ $? -ne 0 ]; then
   exit 1
 fi
 
+# --- Compat shim #3: drivers/kernelsu/infra/file_wrapper.c (a "proxy file"
+# subsystem used for pts/file hiding, unconditionally compiled — no Kconfig
+# gate) uses struct file_operations members iopoll/remap_file_range and the
+# REMAP_FILE_DEDUP flag. These are real upstream Linux VFS additions (5.3+
+# for the unified remap_file_range; this file has used iopoll since its
+# introduction in Nov 2025), not SUSFS-specific — this 4.19 tree's
+# include/linux/fs.h genuinely doesn't have them (confirmed: only the older
+# split clone_file_range/dedupe_file_range exist here, and no iopoll member
+# at all). No SUSFS kernel-patch version could add real upstream VFS struct
+# fields to an old kernel tree, so this isn't fixable by bumping susfs4ksu —
+# it has to be handled in the driver code itself.
+#
+# Fix: detect at build time (by actually parsing this kernel's own
+# include/linux/fs.h, not by guessing a LINUX_VERSION_CODE threshold that
+# vendor kernels routinely diverge from) whether these fields exist, and
+# only compile the driver's use of them if they do. Where they don't, the
+# corresponding p->ops.* fields are simply left unset — p is allocated with
+# kcalloc (verified), so they default to NULL exactly as if the field were
+# assigned NULL explicitly. This preserves every other bit of dev-susfs's
+# newer functionality (no_su, zygote_next, SUSFS 2.1.0+ features) instead of
+# rolling back to a pre-Nov-2025 snapshot, which would also lose those.
+python3 - << 'PYEOF'
+import re
+
+path_fops_src = "include/linux/fs.h"
+path_target = "drivers/kernelsu/infra/file_wrapper.c"
+
+with open(path_fops_src) as f:
+    fs_h = f.read()
+m = re.search(r'struct file_operations \{(.*?)\n\};', fs_h, re.S)
+if not m:
+    raise SystemExit("could not locate struct file_operations in include/linux/fs.h")
+fops_body = m.group(1)
+has_iopoll = "iopoll" in fops_body
+has_remap = "remap_file_range" in fops_body
+print(f"file_wrapper.c compat: has_iopoll={has_iopoll} has_remap_file_range={has_remap}")
+
+with open(path_target) as f:
+    content = f.read()
+
+if "struct file_operations on this kernel" in content:
+    print("file_wrapper.c already patched, skipping")
+else:
+    iopoll_block = '''#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+static int ksu_wrapper_iopoll(struct kiocb *kiocb, struct io_comp_batch *icb,
+                              unsigned int v)
+{
+    struct ksu_file_wrapper *data = kiocb->ki_filp->private_data;
+    struct file *orig = data->orig;
+    kiocb->ki_filp = orig;
+    return orig->f_op->iopoll(kiocb, icb, v);
+}
+#else
+static int ksu_wrapper_iopoll(struct kiocb *kiocb, bool spin)
+{
+    struct ksu_file_wrapper *data = kiocb->ki_filp->private_data;
+    struct file *orig = data->orig;
+    kiocb->ki_filp = orig;
+    return orig->f_op->iopoll(kiocb, spin);
+}
+#endif'''
+    if iopoll_block not in content:
+        raise SystemExit("file_wrapper.c: iopoll function block not found verbatim, refusing to patch blindly")
+    if not has_iopoll:
+        content = content.replace(
+            iopoll_block,
+            "#if 0 /* struct file_operations on this kernel has no iopoll member */\n"
+            + iopoll_block + "\n#endif",
+            1,
+        )
+
+    iopoll_assign = "    p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;"
+    if iopoll_assign not in content:
+        raise SystemExit("file_wrapper.c: iopoll assignment line not found verbatim, refusing to patch blindly")
+    if not has_iopoll:
+        content = content.replace(
+            iopoll_assign,
+            "    /* iopoll not present on this kernel's file_operations */",
+            1,
+        )
+
+    remap_block = '''// no REMAP_FILE_DEDUP: use file_in
+// https://cs.android.com/android/kernel/superproject/+/common-android-mainline:common/fs/read_write.c;l=1598-1599;drc=398da7defe218d3e51b0f3bdff75147e28125b60
+// https://cs.android.com/android/kernel/superproject/+/common-android-mainline:common/fs/remap_range.c;l=403-404;drc=398da7defe218d3e51b0f3bdff75147e28125b60
+// REMAP_FILE_DEDUP: use file_out
+// https://cs.android.com/android/kernel/superproject/+/common-android-mainline:common/fs/remap_range.c;l=483-484;drc=398da7defe218d3e51b0f3bdff75147e28125b60
+static loff_t ksu_wrapper_remap_file_range(struct file *file_in, loff_t pos_in,
+                                           struct file *file_out,
+                                           loff_t pos_out, loff_t len,
+                                           unsigned int remap_flags)
+{
+    if (remap_flags & REMAP_FILE_DEDUP) {
+        struct ksu_file_wrapper *data = file_out->private_data;
+        struct file *orig = data->orig;
+        return orig->f_op->remap_file_range(file_in, pos_in, orig, pos_out, len,
+                                            remap_flags);
+    } else {
+        struct ksu_file_wrapper *data = file_in->private_data;
+        struct file *orig = data->orig;
+        return orig->f_op->remap_file_range(orig, pos_in, file_out, pos_out,
+                                            len, remap_flags);
+    }
+}'''
+    if remap_block not in content:
+        raise SystemExit("file_wrapper.c: remap_file_range function block not found verbatim, refusing to patch blindly")
+    if not has_remap:
+        content = content.replace(
+            remap_block,
+            "#if 0 /* struct file_operations on this kernel has no remap_file_range member */\n"
+            + remap_block + "\n#endif",
+            1,
+        )
+
+    remap_assign = """    p->ops.remap_file_range =
+        fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;"""
+    if remap_assign not in content:
+        raise SystemExit("file_wrapper.c: remap_file_range assignment lines not found verbatim, refusing to patch blindly")
+    if not has_remap:
+        content = content.replace(
+            remap_assign,
+            "    /* remap_file_range not present on this kernel's file_operations */",
+            1,
+        )
+
+    with open(path_target, "w") as f:
+        f.write(content)
+    print("Patched drivers/kernelsu/infra/file_wrapper.c for this kernel's actual file_operations layout")
+PYEOF
+if [ $? -ne 0 ]; then
+  echo "!!! BUILD ABORTED: failed to patch drivers/kernelsu/infra/file_wrapper.c."
+  exit 1
+fi
+
 echo "-perf" > localversion
 # Build it — tee the log so we can read back Kbuild's own resolved version
 # string for the zip name, instead of hand-typing a version that can drift
