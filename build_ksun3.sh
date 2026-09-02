@@ -133,21 +133,27 @@ cat > include/linux/minmax.h << 'EOF'
 EOF
 fi
 
-# --- Compat shim #2: drivers/kernelsu/feature/sucompat.c also calls
+# --- Compat shim #2: newer KSU-Next driver code (pershoot/dev-susfs) calls
+# three functions that don't exist in the susfs4ksu 2.1.0 kernel-side patches
+# applied above (cherry-picked from Joe7500's fork):
 #   susfs_is_current_proc_no_su() / susfs_set_current_proc_no_su()
-# These don't exist in the susfs4ksu 2.1.0 kernel-side patches applied above
-# (cherry-picked from Joe7500's fork) — they're newer SUSFS driver-side API
-# that pershoot's dev-susfs (nightly, well past 2.1.0) expects. This is a
-# genuine version mismatch between the kernel-side SUSFS patch version and
-# the KSU-Next driver's SUSFS integration code, not a missing header.
-#
-# Fix: implement both functions using the EXACT same pattern susfs_def.h
-# already uses for its existing per-process flag
-# (susfs_is_current_proc_umounted, at TIF bit 33) — a dedicated bit in
-# task_struct->thread_info.flags via the kernel's own test_ti_thread_flag /
-# set_ti_thread_flag helpers. Verified no collision: arch/arm64's own TIF_*
-# bits top out at 26 (TIF_TAGGED_ADDR), and susfs_def.h's own custom bit is
-# 33, so bit 34 is safe.
+#     — used in feature/sucompat.c
+#   susfs_set_current_proc_umounted_for_zygote_next()
+#     — used in hook/setuid_hook.c, always alongside the existing
+#       susfs_set_current_proc_umounted(). Verified (grepped dev-susfs's
+#       entire kernel/ tree): this is set-only, nothing ever reads it back —
+#       and our 2.1.0 kernel-side susfs.c has no concept of it either, so
+#       it's currently inert either way. Implementing it for real costs
+#       nothing and carries no behavioral risk; a silent no-op stub would
+#       have been the wrong call if that ever changes upstream.
+# This is a genuine version mismatch between the kernel-side SUSFS patch
+# version and the KSU-Next driver's SUSFS integration code, not a missing
+# header. Fix: implement all three using the EXACT same pattern susfs_def.h
+# already uses for its existing per-process flag (susfs_is_current_proc_umounted,
+# at TIF bit 33) — dedicated bits in task_struct->thread_info.flags via the
+# kernel's own test_ti_thread_flag / set_ti_thread_flag helpers. Verified no
+# collision: arch/arm64's own TIF_* bits top out at 26 (TIF_TAGGED_ADDR), and
+# susfs_def.h's own custom bit is 33, so bits 34/35 are safe.
 python3 - << 'PYEOF'
 path = "include/linux/susfs_def.h"
 with open(path) as f:
@@ -155,11 +161,12 @@ with open(path) as f:
 if "susfs_is_current_proc_no_su" not in content:
     marker = "#endif // #ifndef KSU_SUSFS_DEF_H"
     shim = '''
-/* --- compat shim: pershoot/dev-susfs's sucompat.c calls these two
- * functions, which don't exist in susfs4ksu 2.1.0. Mirrors the existing
- * susfs_is_current_proc_umounted pattern above using a dedicated, unused
- * TIF bit. --- */
+/* --- compat shim: pershoot/dev-susfs's driver calls these functions,
+ * which don't exist in susfs4ksu 2.1.0. Mirrors the existing
+ * susfs_is_current_proc_umounted pattern above using dedicated, unused
+ * TIF bits. --- */
 #define TIF_PROC_NO_SU 34
+#define TIF_PROC_UMOUNTED_FOR_ZYGOTE_NEXT 35
 
 static inline bool susfs_is_current_proc_no_su(void) {
 \treturn test_ti_thread_flag(&current->thread_info, TIF_PROC_NO_SU);
@@ -169,18 +176,26 @@ static inline void susfs_set_current_proc_no_su(void) {
 \tset_ti_thread_flag(&current->thread_info, TIF_PROC_NO_SU);
 }
 
+static inline bool susfs_is_current_proc_umounted_for_zygote_next(void) {
+\treturn test_ti_thread_flag(&current->thread_info, TIF_PROC_UMOUNTED_FOR_ZYGOTE_NEXT);
+}
+
+static inline void susfs_set_current_proc_umounted_for_zygote_next(void) {
+\tset_ti_thread_flag(&current->thread_info, TIF_PROC_UMOUNTED_FOR_ZYGOTE_NEXT);
+}
+
 '''
     if marker not in content:
         raise SystemExit("susfs_def.h: expected marker not found, refusing to patch blindly")
     content = content.replace(marker, shim + marker, 1)
     with open(path, "w") as f:
         f.write(content)
-    print("Patched include/linux/susfs_def.h with no_su compat shim")
+    print("Patched include/linux/susfs_def.h with no_su + zygote_next compat shim")
 else:
-    print("include/linux/susfs_def.h already has no_su shim, skipping")
+    print("include/linux/susfs_def.h already has the compat shim, skipping")
 PYEOF
 if [ $? -ne 0 ]; then
-  echo "!!! BUILD ABORTED: failed to patch include/linux/susfs_def.h with the no_su compat shim."
+  echo "!!! BUILD ABORTED: failed to patch include/linux/susfs_def.h with the compat shim."
   exit 1
 fi
 
