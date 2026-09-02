@@ -60,7 +60,25 @@ rm -rf KernelSU-Next
 curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/dev-susfs/kernel/setup.sh" | bash -s "$KSU_REF" || exit 1
 
 echo "CONFIG_KSU=y" >> arch/arm64/configs/vendor/bengal-perf_defconfig
-echo "# CONFIG_KPROBES is not set" >> arch/arm64/configs/vendor/bengal-perf_defconfig
+# --- FIX ---
+# dev-susfs's top-level Kconfig has:
+#   config KSU
+#       tristate "KernelSU function support"
+#       depends on KPROBES || SUSFS
+# There is NO "CONFIG_SUSFS" Kconfig symbol anywhere in this kernel tree —
+# verified by grepping the full source after the susfs4ksu cherry-picks above
+# are applied. Those patches add fs/susfs.c etc. but never define a top-level
+# "config SUSFS" toggle. So the "|| SUSFS" half of that dependency can never
+# be satisfied here, which makes KPROBES mandatory. The old (pre-version-bump)
+# script disabled KPROBES because an older KSU-Next Kconfig didn't gate KSU on
+# it this way — dev-susfs does. Disabling it here silently clamped
+# CONFIG_KSU (and therefore every CONFIG_KSU_SUSFS_* option, which all
+# `depends on KSU`) to unset, with only a Kconfig "override: reassigning"
+# warning to show for it — no hard error, which is exactly why this shipped
+# silently before the safety check below caught it.
+# MODULES=y is already set in the stock bengal-perf_defconfig, and
+# HAVE_KPROBES is auto-selected on arm64, so this has no other blockers.
+echo "CONFIG_KPROBES=y" >> arch/arm64/configs/vendor/bengal-perf_defconfig
 echo "CONFIG_HAVE_SYSCALL_TRACEPOINTS=y" >> arch/arm64/configs/vendor/bengal-perf_defconfig
 echo "CONFIG_KSU_MANUAL_HOOK=y" >> arch/arm64/configs/vendor/bengal-perf_defconfig
 if grep -q "THREAD_INFO_IN_TASK" "drivers/kernelsu/Kconfig"; then
@@ -99,18 +117,25 @@ BUILD_LOG="ksun3_build.log"
 make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 $DEFCONFIG
 
 # --- Hard safety check ---
-# This is the exact class of bug that shipped a non-SUSFS (and possibly
-# non-rooted) kernel silently last time: KernelSU-Next got checked out at
-# the wrong ref, CONFIG_KSU_SUSFS_* lines got dropped with zero warning
-# (unknown Kconfig symbols aren't errors), and the build "succeeded" anyway.
-# Verify the *resolved* .config actually has what we asked for, and abort
-# the build immediately if not, instead of shipping a broken zip.
+# This is the exact class of bug that's bitten this build twice now: a
+# defconfig line gets "accepted" (Kconfig even prints "override: reassigning
+# to symbol X") but the *resolved* value in .config still ends up unset,
+# because some dependency wasn't met — with nothing louder than a warning to
+# show for it. Verify what actually landed, and if it didn't, dump the real
+# state instead of just saying "it failed" again.
 if ! grep -q "^CONFIG_KSU=y" out/.config; then
-  echo "!!! BUILD ABORTED: CONFIG_KSU did not land in out/.config — KernelSU-Next was not actually configured in. Check the KernelSU-Next checkout step above (wrong ref / detached HEAD / wrong tag) before continuing."
+  echo "!!! BUILD ABORTED: CONFIG_KSU did not land in out/.config."
+  echo "--- Resolved KSU-related lines from out/.config: ---"
+  grep -E "^(CONFIG_KSU|CONFIG_KPROBES|CONFIG_MODULES|CONFIG_THREAD_INFO_IN_TASK)|# CONFIG_(KSU|KPROBES) is not set" out/.config
+  echo "--- KSU's own Kconfig dependency line, for reference: ---"
+  grep -A2 "^config KSU$" drivers/kernelsu/Kconfig 2>/dev/null
   exit 1
 fi
 if ! grep -q "^CONFIG_KSU_SUSFS=y" out/.config; then
-  echo "!!! BUILD ABORTED: CONFIG_KSU_SUSFS did not land in out/.config — this means the KernelSU-Next source checked out does NOT have SUSFS support (e.g. it landed on a plain release tag instead of the dev-susfs branch). Check the setup.sh invocation above — it must be passed an explicit ref."
+  echo "!!! BUILD ABORTED: CONFIG_KSU_SUSFS did not land in out/.config."
+  echo "--- Resolved SUSFS-related lines from out/.config: ---"
+  grep -E "^CONFIG_KSU_SUSFS|# CONFIG_KSU_SUSFS is not set" out/.config
+  echo "--- Possible causes: KernelSU-Next checked out at the wrong ref (not dev-susfs), or an unmet dependency clamped it the same way CONFIG_KSU was clamped above. ---"
   exit 1
 fi
 echo "Verified: CONFIG_KSU=y and CONFIG_KSU_SUSFS=y are present in out/.config"
