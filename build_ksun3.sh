@@ -107,6 +107,32 @@ echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> arch/arm64/configs/vendor/bengal-perf_defco
 # exists on dev-susfs; setting it would just be a harmless dead line, but
 # there's no reason to carry it forward.)
 
+# --- Compat shim: drivers/kernelsu/feature/sucompat.c does
+#   #ifdef CONFIG_KSU_SUSFS
+#   #include <linux/minmax.h>
+#   #endif
+# <linux/minmax.h> is where upstream Linux split min()/max()/clamp() out of
+# kernel.h starting around 5.14 — this tree is 4.19 and doesn't have that
+# file at all, so this include fails outright ("file not found"), not a
+# missing-macro error. Verified: nothing in sucompat.c or the susfs headers
+# actually calls anything beyond what THIS tree's include/linux/kernel.h
+# already defines (min/max/min_t/max_t/min3/max3/clamp/clamp_t/clamp_val are
+# all already present there). So this is purely a missing forwarding header,
+# not a missing feature — a one-line shim that just pulls in kernel.h
+# resolves it with no behavior change.
+mkdir -p include/linux
+if [ ! -f include/linux/minmax.h ]; then
+cat > include/linux/minmax.h << 'EOF'
+/* Compat shim for this 4.19 tree: upstream split min()/max()/clamp() into
+ * this header starting ~5.14. This kernel still defines them in kernel.h,
+ * so just pull that in. */
+#ifndef _LINUX_MINMAX_H
+#define _LINUX_MINMAX_H
+#include <linux/kernel.h>
+#endif
+EOF
+fi
+
 echo "-perf" > localversion
 # Build it — tee the log so we can read back Kbuild's own resolved version
 # string for the zip name, instead of hand-typing a version that can drift
