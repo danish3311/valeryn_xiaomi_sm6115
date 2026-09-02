@@ -133,6 +133,57 @@ cat > include/linux/minmax.h << 'EOF'
 EOF
 fi
 
+# --- Compat shim #2: drivers/kernelsu/feature/sucompat.c also calls
+#   susfs_is_current_proc_no_su() / susfs_set_current_proc_no_su()
+# These don't exist in the susfs4ksu 2.1.0 kernel-side patches applied above
+# (cherry-picked from Joe7500's fork) — they're newer SUSFS driver-side API
+# that pershoot's dev-susfs (nightly, well past 2.1.0) expects. This is a
+# genuine version mismatch between the kernel-side SUSFS patch version and
+# the KSU-Next driver's SUSFS integration code, not a missing header.
+#
+# Fix: implement both functions using the EXACT same pattern susfs_def.h
+# already uses for its existing per-process flag
+# (susfs_is_current_proc_umounted, at TIF bit 33) — a dedicated bit in
+# task_struct->thread_info.flags via the kernel's own test_ti_thread_flag /
+# set_ti_thread_flag helpers. Verified no collision: arch/arm64's own TIF_*
+# bits top out at 26 (TIF_TAGGED_ADDR), and susfs_def.h's own custom bit is
+# 33, so bit 34 is safe.
+python3 - << 'PYEOF'
+path = "include/linux/susfs_def.h"
+with open(path) as f:
+    content = f.read()
+if "susfs_is_current_proc_no_su" not in content:
+    marker = "#endif // #ifndef KSU_SUSFS_DEF_H"
+    shim = '''
+/* --- compat shim: pershoot/dev-susfs's sucompat.c calls these two
+ * functions, which don't exist in susfs4ksu 2.1.0. Mirrors the existing
+ * susfs_is_current_proc_umounted pattern above using a dedicated, unused
+ * TIF bit. --- */
+#define TIF_PROC_NO_SU 34
+
+static inline bool susfs_is_current_proc_no_su(void) {
+\treturn test_ti_thread_flag(&current->thread_info, TIF_PROC_NO_SU);
+}
+
+static inline void susfs_set_current_proc_no_su(void) {
+\tset_ti_thread_flag(&current->thread_info, TIF_PROC_NO_SU);
+}
+
+'''
+    if marker not in content:
+        raise SystemExit("susfs_def.h: expected marker not found, refusing to patch blindly")
+    content = content.replace(marker, shim + marker, 1)
+    with open(path, "w") as f:
+        f.write(content)
+    print("Patched include/linux/susfs_def.h with no_su compat shim")
+else:
+    print("include/linux/susfs_def.h already has no_su shim, skipping")
+PYEOF
+if [ $? -ne 0 ]; then
+  echo "!!! BUILD ABORTED: failed to patch include/linux/susfs_def.h with the no_su compat shim."
+  exit 1
+fi
+
 echo "-perf" > localversion
 # Build it — tee the log so we can read back Kbuild's own resolved version
 # string for the zip name, instead of hand-typing a version that can drift
