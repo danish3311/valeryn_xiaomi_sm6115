@@ -416,6 +416,139 @@ if [ $? -ne 0 ]; then
   exit 1
 fi
 
+# --- Compat shim #5: drivers/kernelsu/manager/pkg_observer.c hardcodes the
+# 5.9+ struct fsnotify_ops field (.handle_inode_event) and function
+# signature (mark, mask, inode, dir, const struct qstr *file_name, cookie).
+# This kernel's real struct fsnotify_ops (verified against
+# include/linux/fsnotify_backend.h) only has the older field
+# (.handle_event), with the pre-5.2 signature (group, inode, mask, data,
+# data_type, const unsigned char *file_name, cookie, iter_info).
+#
+# Unlike the earlier shims, this one isn't a fabricated fix — it's restoring
+# code that used to exist. The working KernelSU-Next-susfs-3.2.0 source (the
+# tarball this whole build used to be based on, from the now-deleted
+# pershoot legacy-susfs branch) shipped a small header,
+# kernel/manager/pkg_observer_defs.h, with a KSU_DECL_FSNOTIFY_OPS(name)
+# macro that expands to the correct signature for FIVE different kernel-
+# version brackets (pre-4.12, 4.12–4.18, 4.18–5.2, 5.2–5.9, 5.9+), plus
+# ksu_fname_len()/ksu_fname_arg() helper macros so the same function BODY
+# works across all of them. dev-susfs deleted this file entirely and kept
+# only the 5.9+ branch's signature, unconditionally.
+# Fix: restore that original file verbatim, and restore pkg_observer.c's use
+# of it (also matching the 3.2.0 source, adapted to dev-susfs's current
+# variable names — functionally identical logic either way: detect
+# "packages.list" in /data/system and call track_throne(false)).
+python3 - << 'PYEOF'
+path_defs = "drivers/kernelsu/manager/pkg_observer_defs.h"
+path_target = "drivers/kernelsu/manager/pkg_observer.c"
+
+defs_content = '''// This header should not be used outside of pkg_observer.c!
+
+#include <linux/version.h>
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0)
+typedef const struct qstr *ksu_fname_t;
+#define ksu_fname_len(f) ((f)->len)
+#define ksu_fname_arg(f) ((f)->name)
+#else
+typedef const unsigned char *ksu_fname_t;
+#define ksu_fname_len(f) (strlen(f))
+#define ksu_fname_arg(f) (f)
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+#define KSU_DECL_FSNOTIFY_OPS(name)                                            \\
+\tint name(struct fsnotify_mark *mark, u32 mask, struct inode *inode,    \\
+\t\t struct inode *dir, const struct qstr *file_name, u32 cookie)
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0)
+#define KSU_DECL_FSNOTIFY_OPS(name)                                            \\
+\tint name(struct fsnotify_group *group, struct inode *inode, u32 mask,  \\
+\t\t const void *data, int data_type, ksu_fname_t file_name,       \\
+\t\t u32 cookie, struct fsnotify_iter_info *iter_info)
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 18, 0)
+#define KSU_DECL_FSNOTIFY_OPS(name)                                            \\
+\tint name(struct fsnotify_group *group, struct inode *inode, u32 mask,  \\
+\t\t const void *data, int data_type, ksu_fname_t file_name,       \\
+\t\t u32 cookie, struct fsnotify_iter_info *iter_info)
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0)
+#define KSU_DECL_FSNOTIFY_OPS(name)                                            \\
+\tint name(struct fsnotify_group *group, struct inode *inode,            \\
+\t\t struct fsnotify_mark *inode_mark,                             \\
+\t\t struct fsnotify_mark *vfsmount_mark, u32 mask,                \\
+\t\t const void *data, int data_type, ksu_fname_t file_name,       \\
+\t\t u32 cookie, struct fsnotify_iter_info *iter_info)
+#else
+#define KSU_DECL_FSNOTIFY_OPS(name)                                            \\
+\tint name(struct fsnotify_group *group, struct inode *inode,            \\
+\t\t struct fsnotify_mark *inode_mark,                             \\
+\t\t struct fsnotify_mark *vfsmount_mark, u32 mask, void *data,    \\
+\t\t int data_type, ksu_fname_t file_name, u32 cookie)
+#endif
+'''
+
+with open(path_defs, "w") as f:
+    f.write(defs_content)
+print("Restored drivers/kernelsu/manager/pkg_observer_defs.h")
+
+with open(path_target) as f:
+    content = f.read()
+
+if "KSU_DECL_FSNOTIFY_OPS" in content:
+    print("pkg_observer.c already patched, skipping")
+else:
+    old_block = '''static int ksu_handle_inode_event(struct fsnotify_mark *mark, u32 mask,
+                                  struct inode *inode, struct inode *dir,
+                                  const struct qstr *file_name, u32 cookie)
+{
+    if (!file_name)
+        return 0;
+    if (mask & FS_ISDIR)
+        return 0;
+    if (file_name->len == 13 && !memcmp(file_name->name, "packages.list", 13)) {
+        pr_info("packages.list detected: %d\\n", mask);
+        track_throne(false);
+    }
+    return 0;
+}
+
+static const struct fsnotify_ops ksu_ops = {
+\t.handle_inode_event = ksu_handle_inode_event,
+};'''
+    if old_block not in content:
+        raise SystemExit("pkg_observer.c: expected verbatim block not found, refusing to patch blindly")
+
+    new_block = '''#include "pkg_observer_defs.h" // KSU_DECL_FSNOTIFY_OPS
+static KSU_DECL_FSNOTIFY_OPS(ksu_handle_inode_event)
+{
+    if (!file_name)
+        return 0;
+    if (mask & FS_ISDIR)
+        return 0;
+    if (ksu_fname_len(file_name) == 13 &&
+        !memcmp(ksu_fname_arg(file_name), "packages.list", 13)) {
+        pr_info("packages.list detected: %d\\n", mask);
+        track_throne(false);
+    }
+    return 0;
+}
+
+static const struct fsnotify_ops ksu_ops = {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+\t.handle_inode_event = ksu_handle_inode_event,
+#else
+\t.handle_event = ksu_handle_inode_event,
+#endif
+};'''
+    content = content.replace(old_block, new_block, 1)
+    with open(path_target, "w") as f:
+        f.write(content)
+    print("Patched drivers/kernelsu/manager/pkg_observer.c to use KSU_DECL_FSNOTIFY_OPS")
+PYEOF
+if [ $? -ne 0 ]; then
+  echo "!!! BUILD ABORTED: failed to patch pkg_observer.c / pkg_observer_defs.h."
+  exit 1
+fi
+
 echo "-perf" > localversion
 # Build it — tee the log so we can read back Kbuild's own resolved version
 # string for the zip name, instead of hand-typing a version that can drift
