@@ -332,6 +332,63 @@ if [ $? -ne 0 ]; then
   exit 1
 fi
 
+# --- Compat shim #4: drivers/kernelsu/infra/seccomp_cache.c locally
+# redefines the KERNEL-INTERNAL (not publicly exposed) "struct
+# seccomp_filter" to reach into a "cache" bitmap field for a seccomp
+# fast-path optimization added upstream around Linux 5.11+. Verified against
+# this kernel's own kernel/seccomp.c: the REAL internal struct here has only
+# 4 fields (usage, log, prev, prog) — no cache field at all. The driver's
+# local shadow copy has 10 fields including one this kernel's real struct
+# doesn't have. Patching just the missing SECCOMP_ARCH_NATIVE_NR constant to
+# make this compile would NOT make it correct — ksu_seccomp_clear_cache/
+# ksu_seccomp_allow_cache would read/write memory at an offset that doesn't
+# correspond to any real field in this kernel's actual struct, i.e. silent
+# memory corruption if ever called.
+# Verified (grepped the entire dev-susfs kernel/ tree): NOTHING calls either
+# function anywhere in this driver — they're declared in seccomp_cache.h for
+# a companion kernel-side patch to call, which our SUSFS 2.1.0 kernel
+# patches don't include. So this is genuinely dead code in our build as-is.
+# The safe fix is to exclude the file from compilation entirely (equivalent
+# to what already happens at runtime — never reached) rather than fabricate
+# a fake definition of SECCOMP_ARCH_NATIVE_NR that would make broken code
+# merely compile instead of correctly never-execute.
+python3 - << 'PYEOF'
+import re
+
+with open("include/linux/seccomp.h") as f:
+    seccomp_h = f.read()
+has_arch_native_nr = "SECCOMP_ARCH_NATIVE_NR" in seccomp_h
+print(f"seccomp_cache.c compat: has_SECCOMP_ARCH_NATIVE_NR={has_arch_native_nr}")
+
+if not has_arch_native_nr:
+    kbuild_path = "drivers/kernelsu/Kbuild"
+    with open(kbuild_path) as f:
+        content = f.read()
+    line = "kernelsu-objs += infra/seccomp_cache.o"
+    if line not in content:
+        raise SystemExit("drivers/kernelsu/Kbuild: expected seccomp_cache.o line not found verbatim, refusing to patch blindly")
+    if "# excluded: no SECCOMP_ARCH_NATIVE_NR" not in content:
+        content = content.replace(
+            line,
+            "# excluded: no SECCOMP_ARCH_NATIVE_NR on this kernel, and nothing calls\n"
+            "# ksu_seccomp_clear_cache/ksu_seccomp_allow_cache anywhere in this driver\n"
+            "# tree, so this file is dead code here — see build script for full reasoning\n"
+            "# kernelsu-objs += infra/seccomp_cache.o",
+            1,
+        )
+        with open(kbuild_path, "w") as f:
+            f.write(content)
+        print("Excluded infra/seccomp_cache.o from drivers/kernelsu/Kbuild")
+    else:
+        print("infra/seccomp_cache.o already excluded, skipping")
+else:
+    print("This kernel has SECCOMP_ARCH_NATIVE_NR — leaving seccomp_cache.o in the build as-is")
+PYEOF
+if [ $? -ne 0 ]; then
+  echo "!!! BUILD ABORTED: failed to patch drivers/kernelsu/Kbuild to exclude infra/seccomp_cache.o."
+  exit 1
+fi
+
 echo "-perf" > localversion
 # Build it — tee the log so we can read back Kbuild's own resolved version
 # string for the zip name, instead of hand-typing a version that can drift
