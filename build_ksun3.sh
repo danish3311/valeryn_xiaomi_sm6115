@@ -133,6 +133,33 @@ cat > include/linux/minmax.h << 'EOF'
 EOF
 fi
 
+# --- Compat shim #1b: drivers/kernelsu/infra/su_mount_ns.c does
+#   #include <uapi/linux/mount.h>
+# Upstream split various UAPI mount-related definitions out of
+# include/uapi/linux/fs.h into a dedicated include/uapi/linux/mount.h
+# starting around Linux 5.2 (for the new mount API — fsopen/fsconfig/
+# move_mount/open_tree, MOUNT_ATTR_* flags, struct mount_attr, etc). This
+# 4.19 tree predates that split, so the header genuinely doesn't exist here.
+# Verified: su_mount_ns.c only actually uses two symbols from it — MS_PRIVATE
+# and MS_REC (both classic, ancient mount flags, not part of the newer mount
+# API at all) — and both are already defined in this tree's
+# include/uapi/linux/fs.h. So again this is a missing forwarding header, not
+# a missing feature: a shim that pulls in fs.h resolves it with no behavior
+# change.
+mkdir -p include/uapi/linux
+if [ ! -f include/uapi/linux/mount.h ]; then
+cat > include/uapi/linux/mount.h << 'EOF'
+/* Compat shim for this 4.19 tree: upstream split various mount-related UAPI
+ * definitions into this header starting ~5.2. The only symbols this
+ * kernel's KernelSU-Next driver actually needs from it (MS_PRIVATE, MS_REC)
+ * are already defined in uapi/linux/fs.h, so just pull that in. */
+#ifndef _UAPI_LINUX_MOUNT_H
+#define _UAPI_LINUX_MOUNT_H
+#include <uapi/linux/fs.h>
+#endif
+EOF
+fi
+
 # --- Compat shim #2: newer KSU-Next driver code (pershoot/dev-susfs) calls
 # three functions that don't exist in the susfs4ksu 2.1.0 kernel-side patches
 # applied above (cherry-picked from Joe7500's fork):
