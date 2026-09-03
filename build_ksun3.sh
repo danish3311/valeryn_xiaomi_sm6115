@@ -701,6 +701,21 @@ with open(rules_path) as f:
 if "#ifndef SELINUX_POLICY_INSTEAD_SELINUX_SS" in content:
     print("rules.c already patched, skipping")
 else:
+    # --- Step 0: restore the missing <linux/stop_machine.h> include.
+    # 3.2.0 had it (its old path calls stop_machine()); dev-susfs never
+    # included it since its RCU-only path never calls stop_machine at all.
+    # My restored old-path code below calls it, so it needs to be here too
+    # — genuinely my own oversight in the first pass of this patch, not a
+    # dev-susfs regression.
+    include_anchor = "#include <linux/string.h>"
+    if content.count(include_anchor) != 1:
+        raise SystemExit(f"rules.c: expected exactly one match for include anchor, found {content.count(include_anchor)}, refusing to patch blindly")
+    content = content.replace(
+        include_anchor,
+        include_anchor + "\n#include <linux/stop_machine.h> // for the restored pre-5.10 path below",
+        1,
+    )
+
     # --- Step 1: conditional SELINUX_POLICY_INSTEAD_SELINUX_SS + old helpers ---
     old_header = '''struct selinux_policy *backup_sepolicy;
 
