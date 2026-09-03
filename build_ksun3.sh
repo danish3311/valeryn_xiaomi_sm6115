@@ -598,6 +598,477 @@ if [ $? -ne 0 ]; then
   exit 1
 fi
 
+
+# --- Compat shim #7: this is the largest fix in the chain so far, and
+# touches core SELinux policy manipulation, so it's worth explaining fully.
+#
+# security/selinux/rules.c error: "no member named 'policy' in
+# 'struct selinux_state'" / "no member named 'policy_mutex'" / "incomplete
+# definition of type 'struct selinux_policy'".
+#
+# Root cause: SELinux upstream restructured how policy is stored around
+# Linux 5.10+ — from a single mutable policydb protected by a rwlock, to an
+# RCU-swappable "struct selinux_policy" the kernel dup-and-swaps atomically.
+# dev-susfs's rules.c unconditionally assumes the NEW model
+# (#define SELINUX_POLICY_INSTEAD_SELINUX_SS with no version guard at all).
+# The working KernelSU-Next-susfs-3.2.0 source (pershoot legacy-susfs,
+# now deleted upstream) supported BOTH models via
+# "#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)" — dev-susfs dropped
+# the old branch entirely.
+#
+# Verified directly against this kernel's real security/selinux headers
+# (not assumed): struct selinux_state here has .ss and .avc (the "middle
+# era" layout, confirmed present), struct selinux_ss has .policydb and
+# .policy_rwlock directly, and struct selinux_policy does not exist
+# anywhere in this kernel's SELinux source at all. Also ran the actual
+# KSU_COMPAT_* detection greps (restored below, verbatim from 3.2.0's own
+# Kbuild) against this kernel to confirm exactly which branch applies here.
+#
+# Fix restores: (1) the version-conditional SELINUX_POLICY_INSTEAD_SELINUX_SS
+# guard, (2) get_policydb()/ksu_get_policy_rwlock()/ksu_get_current_cpumask_t()
+# for the pre-5.10 path, (3) apply_kernelsu_rules() and handle_sepolicy()
+# both split into old (rwlock + stop_machine fallback) and new (RCU
+# dup-and-swap) implementations — using dev-susfs's CURRENT, up-to-date
+# SELinux rule set for both paths (not 3.2.0's older one), so this kernel
+# gets the same rules a modern kernel would, just applied via a
+# version-appropriate safe-locking mechanism.
+#
+# This also transitively fixes a second, related error further into the
+# build: feature/selinux_hide.c depends on struct selinux_policy directly
+# (verified: genuinely new functionality, no equivalent in 3.2.0 at all,
+# and cannot be backported without pulling in real kernel-core SELinux
+# internals, well out of scope for a driver-side compat shim). It has three
+# external callers (core/init.c, runtime/boot_event.c,
+# runtime/ksud_integration.c) expecting five small void functions, so it's
+# replaced with a no-op stub implementing exactly that API rather than
+# excluded from the build (which would leave those callers with undefined
+# references). Every other SUSFS/root feature is unaffected — only this one
+# optional hiding subsystem is disabled on kernels this old.
+python3 - << 'PYEOF'
+import re
+
+# ============================================================
+# Part A: Kbuild compat-macro detection (restored from the working
+# KernelSU-Next-susfs-3.2.0 source). These control which branch rules.c's
+# restored pre-5.10 code takes.
+# ============================================================
+kbuild_path = "drivers/kernelsu/Kbuild"
+with open(kbuild_path) as f:
+    kbuild_content = f.read()
+
+if "KSU_COMPAT_USE_SELINUX_STATE" not in kbuild_content:
+    detection_block = '''
+# --- restored from KernelSU-Next-susfs-3.2.0: detect actual SELinux
+# internal struct layout on this kernel, used by the restored pre-5.10
+# compat path in selinux/rules.c ---
+ifeq ($(shell grep -q "current_sid(void)" $(srctree)/security/selinux/include/objsec.h; echo $$?),0)
+ccflags-y += -DKSU_COMPAT_HAS_CURRENT_SID
+endif
+ifeq ($(shell grep -q "struct selinux_state " $(srctree)/security/selinux/include/security.h; echo $$?),0)
+ccflags-y += -DKSU_COMPAT_USE_SELINUX_STATE
+endif
+ifeq ($(shell grep -q "^DEFINE_RWLOCK(policy_rwlock);" $(srctree)/security/selinux/ss/services.c; echo $$?),0)
+ccflags-y += -DKSU_COMPAT_HAS_EXPORTED_POLICY_RWLOCK
+endif
+ifeq ($(shell grep -q "cpus_ptr;" $(srctree)/include/linux/sched.h; echo $$?),0)
+ccflags-y += -DKSU_COMPAT_HAS_BACKPORTED_CPUS_PTR
+endif
+'''
+    # Insert right after the very first objs line (unique, ":= " not "+=",
+    # never touched by any other patch in this script — safer than
+    # anchoring on "kernelsu-objs +=", which could accidentally match
+    # inside the seccomp-exclusion patch's comment text if that patch runs
+    # first) so ccflags-y is set before anything using it gets compiled.
+    marker = "kernelsu-objs := core/init.o"
+    if kbuild_content.count(marker) != 1:
+        raise SystemExit(f"drivers/kernelsu/Kbuild: expected exactly one match for anchor line, found {kbuild_content.count(marker)}, refusing to patch blindly")
+    kbuild_content = kbuild_content.replace(
+        marker, marker + "\n" + detection_block.strip("\n"), 1
+    )
+    with open(kbuild_path, "w") as f:
+        f.write(kbuild_content)
+    print("Patched drivers/kernelsu/Kbuild with compat-macro detection")
+else:
+    print("Kbuild compat-macro detection already present, skipping")
+
+# ============================================================
+# Part B: selinux/rules.c — restore the pre-5.10 SELinux policy-access path
+# ============================================================
+rules_path = "drivers/kernelsu/selinux/rules.c"
+with open(rules_path) as f:
+    content = f.read()
+
+if "#ifndef SELINUX_POLICY_INSTEAD_SELINUX_SS" in content:
+    print("rules.c already patched, skipping")
+else:
+    # --- Step 1: conditional SELINUX_POLICY_INSTEAD_SELINUX_SS + old helpers ---
+    old_header = '''struct selinux_policy *backup_sepolicy;
+
+#define SELINUX_POLICY_INSTEAD_SELINUX_SS
+
+#define ALL NULL'''
+    if old_header not in content:
+        raise SystemExit("rules.c: header block not found verbatim, refusing to patch blindly")
+
+    new_header = '''struct selinux_policy *backup_sepolicy;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+#define SELINUX_POLICY_INSTEAD_SELINUX_SS
+#endif
+
+#define ALL NULL
+
+#ifndef SELINUX_POLICY_INSTEAD_SELINUX_SS
+/* --- pre-5.10 compat path, restored from the working
+ * KernelSU-Next-susfs-3.2.0 source (pershoot legacy-susfs branch, now
+ * deleted upstream). dev-susfs assumes SELINUX_POLICY_INSTEAD_SELINUX_SS
+ * unconditionally and dropped this branch entirely. --- */
+static struct policydb *get_policydb(void)
+{
+\tstruct policydb *db;
+#ifdef KSU_COMPAT_USE_SELINUX_STATE
+\tstruct selinux_ss *ss = selinux_state.ss;
+\tdb = &ss->policydb;
+#else
+\tdb = &policydb;
+#endif
+\treturn db;
+}
+
+#if defined(KSU_COMPAT_USE_SELINUX_STATE)
+static inline rwlock_t *ksu_get_policy_rwlock(void) { return &selinux_state.ss->policy_rwlock; }
+#elif defined(KSU_COMPAT_HAS_EXPORTED_POLICY_RWLOCK)
+static inline rwlock_t *ksu_get_policy_rwlock(void) { extern rwlock_t policy_rwlock; return &policy_rwlock; }
+#else
+static inline rwlock_t *ksu_get_policy_rwlock(void) { return NULL; }
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0) || defined(KSU_COMPAT_HAS_BACKPORTED_CPUS_PTR)
+static inline const cpumask_t *ksu_get_current_cpumask_t(void) { return current->cpus_ptr; }
+#else
+static inline cpumask_t *ksu_get_current_cpumask_t(void) { return &current->cpus_allowed; }
+#endif
+#endif // #ifndef SELINUX_POLICY_INSTEAD_SELINUX_SS'''
+    content = content.replace(old_header, new_header, 1)
+
+    # --- Step 2: wrap apply_kernelsu_rules(), add old-path + shared helper ---
+    af_start = "void apply_kernelsu_rules()"
+    af_end_marker = "out_unlock:\n    mutex_unlock(&selinux_state.policy_mutex);\n}"
+    af_start_idx = content.index(af_start)
+    af_end_idx = content.index(af_end_marker, af_start_idx) + len(af_end_marker)
+    old_fn = content[af_start_idx:af_end_idx]
+
+    rule_start = '    ksu_type(db, KERNEL_SU_DOMAIN, "domain");'
+    rule_end = '    ksu_allow(db, "kernel", "apk_data_file", "file", "open");'
+    r_start = old_fn.index(rule_start)
+    r_end = old_fn.index(rule_end) + len(rule_end)
+    rule_body = old_fn[r_start:r_end]
+    rule_body_tabbed = "\n".join(
+        ("\t" + l[4:]) if l.startswith("    ") else l for l in rule_body.split("\n")
+    )
+
+    new_fn = ('#ifdef SELINUX_POLICY_INSTEAD_SELINUX_SS\n' + old_fn + '''
+#else
+
+static int apply_kernelsu_rules_fn(void *ptr)
+{
+\tstruct policydb *db = (struct policydb *)ptr;
+
+''' + rule_body_tabbed + '''
+
+\treturn 0;
+}
+
+void apply_kernelsu_rules()
+{
+\tstruct policydb *db;
+\tcpumask_t old_mask;
+
+\tif (!getenforce()) {
+\t\tpr_info("SELinux permissive or disabled, apply rules!\\n");
+\t}
+
+\tdb = get_policydb();
+\trwlock_t *lock = ksu_get_policy_rwlock();
+
+\tif (!lock)
+\t\tgoto do_stop_machine;
+
+\t/*
+\t * HACK: write_lock() is held with preempt enabled. DO NOT let the
+\t * task be migrated to any other CPU than the current CPU. And since
+\t * set_cpus_allowed_ptr() can sleep, use raw_smp_processor_id() to get
+\t * current CPU and bypass preemption checks.
+\t */
+\tcpumask_copy(&old_mask, ksu_get_current_cpumask_t());
+\tset_cpus_allowed_ptr(current, cpumask_of(raw_smp_processor_id()));
+
+\twrite_lock(lock);
+\tpreempt_enable();
+
+\t// we do this dance since both kernel and userspace can trigger this
+\tif (likely(current && current->mm))
+\t\tgoto has_current_mm;
+
+\tapply_kernelsu_rules_fn((void *)db);
+\tgoto out_unlock;
+
+has_current_mm:
+\t;
+
+\t// HACK: raise priority of this to the heavens
+\tint old_policy = current->policy;
+\tstruct sched_param old_param = { .sched_priority = current->rt_priority };
+\tstruct sched_param new_param = { .sched_priority = 50 };
+
+\tsched_setscheduler_nocheck(current, 1, &new_param); // raise, fifo, 50
+\tapply_kernelsu_rules_fn((void *)db);
+\tsched_setscheduler_nocheck(current, old_policy, &old_param); // restore
+
+out_unlock:
+\tpreempt_disable();
+\twrite_unlock(lock);
+\tset_cpus_allowed_ptr(current, &old_mask);
+\tgoto out_flush;
+
+do_stop_machine:
+\tstop_machine(apply_kernelsu_rules_fn, (void *)db, NULL);
+
+out_flush:
+\tsmp_mb();
+\treset_avc_cache();
+}
+#endif // SELINUX_POLICY_INSTEAD_SELINUX_SS''')
+    content = content.replace(old_fn, new_fn, 1)
+
+    # --- Step 3: wrap handle_sepolicy(), add old-path + shared helper ---
+    hs_start = "int handle_sepolicy(void __user *user_data, u64 data_len)"
+    hs_start_idx = content.rindex(hs_start)
+    hs_end_marker = "kvfree(payload);\n\n    return ret;\n}"
+    hs_end_idx = content.index(hs_end_marker, hs_start_idx) + len(hs_end_marker)
+    old_hs = content[hs_start_idx:hs_end_idx]
+
+    new_hs = ('#ifdef SELINUX_POLICY_INSTEAD_SELINUX_SS\n' + old_hs + '''
+#else
+
+struct handle_sepolicy_args {
+\tvoid *ctx_success_cmd_count;
+\tvoid *ctx_payload;
+\tu64 ctx_data_len;
+};
+
+static int handle_sepolicy_fn(void *data)
+{
+\tstruct sepol_batch_cursor cursor;
+\tint ret = 0;
+\tu32 cmd_index = 0;
+\tint success_cmd_count = 0;
+
+\tstruct policydb *db = get_policydb();
+\tstruct handle_sepolicy_args *ctx = (struct handle_sepolicy_args *)data;
+\tu8 *payload = (u8 *)ctx->ctx_payload;
+\tu64 data_len = ctx->ctx_data_len;
+
+\tcursor.cur = payload;
+\tcursor.end = payload + (size_t)data_len;
+
+\twhile (cursor.cur < cursor.end) {
+\t\tstruct sepol_data header;
+\t\tconst char *args[KSU_SEPOLICY_MAX_ARGS] = { 0 };
+\t\tint expected_argc;
+\t\tu32 arg_index;
+
+\t\tret = sepol_read_cmd_header(&cursor, &header);
+\t\tif (ret < 0) {
+\t\t\tpr_err("sepol: failed to read cmd header #%u.\\n", cmd_index);
+\t\t\tgoto out;
+\t\t}
+
+\t\texpected_argc = sepol_expected_argc(header.cmd);
+\t\tif (expected_argc < 0 || expected_argc > KSU_SEPOLICY_MAX_ARGS) {
+\t\t\tret = -EINVAL;
+\t\t\tpr_err("sepol: invalid cmd header #%u.\\n", cmd_index);
+\t\t\tgoto out;
+\t\t}
+
+\t\tfor (arg_index = 0; arg_index < (u32)expected_argc; arg_index++) {
+\t\t\tret = sepol_read_string(&cursor, &args[arg_index]);
+\t\t\tif (ret < 0) {
+\t\t\t\tpr_err("sepol: failed to read cmd #%u arg #%u.\\n", cmd_index, arg_index);
+\t\t\t\tgoto out;
+\t\t\t}
+\t\t}
+
+\t\tret = apply_one_sepolicy_cmd(db, &header, args);
+\t\tif (ret < 0)
+\t\t\tpr_err("sepol: cmd #%u failed, cmd=%u subcmd=%u.\\n", cmd_index, header.cmd, header.subcmd);
+\t\telse {
+\t\t\tsuccess_cmd_count++;
+\t\t}
+
+\t\tcmd_index++;
+\t}
+
+out:
+\t*(int *)(ctx->ctx_success_cmd_count) = success_cmd_count;
+\treturn ret;
+}
+
+int handle_sepolicy(void __user *user_data, u64 data_len)
+{
+\tu8 *payload;
+\tint ret = 0;
+\tint success_cmd_count = 0;
+\tcpumask_t old_mask;
+
+\tif (!user_data || !data_len)
+\t\treturn -EINVAL;
+
+\tif (data_len > KSU_SEPOLICY_MAX_BATCH_SIZE)
+\t\treturn -E2BIG;
+
+\tpayload = kvmalloc((size_t)data_len, GFP_KERNEL);
+\tif (!payload)
+\t\treturn -ENOMEM;
+
+\tif (copy_from_user(payload, user_data, (size_t)data_len)) {
+\t\tret = -EFAULT;
+\t\tgoto out_free;
+\t}
+
+\tif (!getenforce()) {
+\t\tpr_info("SELinux permissive or disabled when handle policy!\\n");
+\t}
+
+\tstruct handle_sepolicy_args ctx = { 0 };
+\tctx.ctx_success_cmd_count = (void *)&success_cmd_count;
+\tctx.ctx_payload = (void *)payload;
+\tctx.ctx_data_len = (u64)data_len;
+
+\trwlock_t *lock = ksu_get_policy_rwlock();
+\tif (!lock)
+\t\tgoto do_stop_machine;
+
+\t/*
+\t * HACK: write_lock() is held with preempt enabled. DO NOT let the
+\t * task be migrated to any other CPU than the current CPU. And since
+\t * set_cpus_allowed_ptr() can sleep, use raw_smp_processor_id() to get
+\t * current CPU and bypass preemption checks.
+\t */
+\tcpumask_copy(&old_mask, ksu_get_current_cpumask_t());
+\tset_cpus_allowed_ptr(current, cpumask_of(raw_smp_processor_id()));
+
+\twrite_lock(lock);
+\tpreempt_enable();
+
+\tif (likely(current && current->mm))
+\t\tgoto has_current_mm;
+
+\tret = handle_sepolicy_fn((void *)&ctx);
+\tgoto out_unlock;
+
+has_current_mm:
+\t;
+
+\tint old_policy = current->policy;
+\tstruct sched_param old_param = { .sched_priority = current->rt_priority };
+\tstruct sched_param new_param = { .sched_priority = 50 };
+
+\tsched_setscheduler_nocheck(current, 1, &new_param);
+\tret = handle_sepolicy_fn((void *)&ctx);
+\tsched_setscheduler_nocheck(current, old_policy, &old_param);
+
+out_unlock:
+\tpreempt_disable();
+\twrite_unlock(lock);
+\tset_cpus_allowed_ptr(current, &old_mask);
+\tgoto out_done;
+
+do_stop_machine:
+\tret = stop_machine(handle_sepolicy_fn, (void *)&ctx, NULL);
+
+out_done:
+\tif (ret)
+\t\tgoto out_free;
+
+\tsmp_mb();
+\treset_avc_cache();
+\tret = success_cmd_count;
+
+out_free:
+\tkvfree(payload);
+
+\treturn ret;
+}
+#endif // SELINUX_POLICY_INSTEAD_SELINUX_SS''')
+    content = content.replace(old_hs, new_hs, 1)
+
+    with open(rules_path, "w") as f:
+        f.write(content)
+    print("Patched drivers/kernelsu/selinux/rules.c with restored pre-5.10 compat path")
+
+# ============================================================
+# Part C: feature/selinux_hide.c — depends on struct selinux_policy, a real
+# kernel-internal type from the ~5.19+ SELinux RCU-policy refactor that does
+# not exist at all in this kernel's actual SELinux source (verified: zero
+# matches for "struct selinux_policy" anywhere under security/selinux/).
+# Making this compile correctly would require backporting real kernel-core
+# SELinux internals, not something a driver-side compat shim can fix. Since
+# it's a genuinely new feature (no equivalent in the working 3.2.0 source at
+# all) with three external callers, stub its small public API instead of
+# excluding the object (which would leave those callers with undefined
+# references).
+# ============================================================
+security_h_path = "security/selinux/include/security.h"
+with open(security_h_path) as f:
+    security_h = f.read()
+has_selinux_policy = bool(re.search(r'struct selinux_policy\b', security_h)) or bool(
+    re.search(r'struct selinux_policy\b', open("security/selinux/ss/services.h").read())
+    if __import__("os").path.exists("security/selinux/ss/services.h") else False
+)
+print(f"selinux_hide.c compat: has_struct_selinux_policy={has_selinux_policy}")
+
+if not has_selinux_policy:
+    sh_path = "drivers/kernelsu/feature/selinux_hide.c"
+    stub_content = '''// SPDX-License-Identifier: GPL-2.0
+/*
+ * Stub for this kernel: selinux_hide's process/domain hiding depends on
+ * struct selinux_policy, a real kernel-internal SELinux type from the
+ * ~5.19+ RCU-policy refactor. It does not exist on this kernel at all
+ * (verified against security/selinux/ — no definition anywhere), so the
+ * real implementation cannot compile here. This is genuinely new
+ * functionality with no equivalent in the working KernelSU-Next-susfs-3.2.0
+ * source this build was originally based on. No-op instead of failing to
+ * build; every other SUSFS/root feature is unaffected.
+ */
+#include <linux/types.h>
+
+bool ksu_selinux_hide_running = false;
+bool ksu_selinux_hide_enabled = false;
+
+void ksu_selinux_hide_init(void) {}
+void ksu_selinux_hide_exit(void) {}
+void ksu_selinux_hide_drop_backup_if_unused(void) {}
+void ksu_selinux_hide_handle_second_stage(void) {}
+void ksu_selinux_hide_handle_post_fs_data(void) {}
+'''
+    with open(sh_path) as f:
+        current_sh = f.read()
+    if current_sh.strip() != stub_content.strip():
+        with open(sh_path, "w") as f:
+            f.write(stub_content)
+        print("Replaced drivers/kernelsu/feature/selinux_hide.c with a no-op stub")
+    else:
+        print("selinux_hide.c already stubbed, skipping")
+else:
+    print("This kernel has struct selinux_policy — leaving selinux_hide.c as-is")
+
+PYEOF
+if [ $? -ne 0 ]; then
+  echo "!!! BUILD ABORTED: failed to patch selinux/rules.c, Kbuild, or feature/selinux_hide.c."
+  exit 1
+fi
+
 echo "-perf" > localversion
 # Build it — tee the log so we can read back Kbuild's own resolved version
 # string for the zip name, instead of hand-typing a version that can drift
