@@ -549,6 +549,55 @@ if [ $? -ne 0 ]; then
   exit 1
 fi
 
+# --- Compat shim #6: drivers/kernelsu/policy/allowlist.c's
+# ksu_persistent_allow_list() is genuinely new functionality — verified it
+# doesn't exist anywhere in the working KernelSU-Next-susfs-3.2.0 source at
+# all, so this isn't a signature drift like the others, it's a feature added
+# since. It hits two separate gaps on this kernel:
+#   1. TWA_RESUME (enum task_work_notify_mode) doesn't exist here.
+#      task_work_add()'s third parameter changed from a plain bool to this
+#      enum around Linux 5.8/5.9 — verified this kernel's task_work.h still
+#      declares it as bool. true is the exact semantic equivalent of
+#      TWA_RESUME (schedule the work via TIF_NOTIFY_RESUME on return to
+#      userspace), so #define TWA_RESUME true is a real fix, not a stub.
+#   2. put_task_struct — implicit-declaration error, but verified this
+#      function genuinely exists in this kernel
+#      (include/linux/sched/task.h, as a static inline) — allowlist.c just
+#      never includes that header. Adding the include is the actual fix,
+#      not a workaround.
+python3 - << 'PYEOF'
+path = "drivers/kernelsu/policy/allowlist.c"
+with open(path) as f:
+    content = f.read()
+
+if "TWA_RESUME true" in content:
+    print("allowlist.c already patched, skipping")
+else:
+    anchor = "#include <linux/kref.h>"
+    if content.count(anchor) != 1:
+        raise SystemExit(f"allowlist.c: expected exactly one match for anchor include, found {content.count(anchor)}, refusing to patch blindly")
+    addition = anchor + '''
+#include <linux/sched/task.h> /* put_task_struct — not always transitively
+                                  included on older kernels */
+
+#ifndef TWA_RESUME
+/* TWA_RESUME (enum task_work_notify_mode) was introduced when
+ * task_work_add()'s third parameter changed from bool to that enum
+ * (~5.8/5.9). This kernel's task_work_add() still takes a plain bool, where
+ * true is the exact equivalent of TWA_RESUME (schedule via
+ * TIF_NOTIFY_RESUME on return to userspace). */
+#define TWA_RESUME true
+#endif'''
+    content = content.replace(anchor, addition, 1)
+    with open(path, "w") as f:
+        f.write(content)
+    print("Patched drivers/kernelsu/policy/allowlist.c with TWA_RESUME + put_task_struct include")
+PYEOF
+if [ $? -ne 0 ]; then
+  echo "!!! BUILD ABORTED: failed to patch drivers/kernelsu/policy/allowlist.c."
+  exit 1
+fi
+
 echo "-perf" > localversion
 # Build it — tee the log so we can read back Kbuild's own resolved version
 # string for the zip name, instead of hand-typing a version that can drift
