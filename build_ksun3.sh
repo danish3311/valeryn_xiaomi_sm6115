@@ -1270,6 +1270,207 @@ if [ $? -ne 0 ]; then
   exit 1
 fi
 
+
+# --- Compat shim #12: this is a link-stage fix, the first one — everything
+# up to here was a compile error. Every "drivers/kernelsu" object compiled
+# cleanly and vmlinux.o's LTO succeeded; these are undefined-symbol errors
+# at final link, three distinct causes bundled together since they're all
+# small:
+#
+# 1. path_mount undefined (infra/su_mount_ns.c): path_mount() (taking a
+#    struct path* directly) doesn't exist on this kernel — verified, this
+#    kernel only has the older do_mount(), which needs a __user path
+#    STRING instead. Converted the already-resolved struct path back to a
+#    string with d_path() and used the classic set_fs(KERNEL_DS) trick to
+#    pass a kernel string where do_mount() expects __user (confirmed
+#    set_fs/KERNEL_DS still present on this arm64/4.19 tree — removed only
+#    on later kernels). do_mount() is non-static (confirmed in
+#    fs/namespace.c) so it links fine despite no EXPORT_SYMBOL, since this
+#    driver is built directly into vmlinux, not a loadable module.
+#
+# 2. seccomp_filter_release undefined (policy/app_profile.c): this
+#    kernel's real function is put_seccomp_filter(struct task_struct *tsk)
+#    — confirmed directly in kernel/seccomp.c, same signature, same
+#    purpose (release the seccomp filter reference held by
+#    tsk->seccomp.filter), just a different name on kernels this old.
+#    Aliased via #define rather than guessing the exact rename version.
+#    (The other seccomp_filter_release reference in this same file, a
+#    kallsyms string lookup for a 6.6-6.11-only backport check, is already
+#    correctly gated behind NEED_BACKPORT_COMPAT and never compiles for
+#    this kernel — verified, no fix needed there.)
+#
+# 3. Six more undefined symbols, all from the kernel-side
+#    "susfs: susfs inline hooks" cherry-pick (sourced from a third-party
+#    patch set, JackA1ltman/NonGKI_Kernel_Build_2nd — a different lineage
+#    than dev-susfs's own hooking approach entirely). Checked each site's
+#    actual diff before writing anything:
+#      - ksu_vfs_read_hook / ksu_execveat_hook / ksu_input_hook: these are
+#        "extern bool ... __read_mostly" GATING FLAGS, not functions — the
+#        kernel-inserted call sites check "if (unlikely(flag))" before
+#        calling a handler. Verified the actual handler functions
+#        (ksu_handle_sys_read, ksu_handle_execveat,
+#        ksu_handle_input_handle_event) are NOT in the undefined-symbol
+#        list, confirming dev-susfs already defines them elsewhere via its
+#        own (working) hooking mechanism — these old-style call sites are
+#        simply unreachable dead code once the flags default false, which
+#        is exactly what we want: dev-susfs's real hooking mechanism stays
+#        the only active path.
+#      - ksu_handle_devpts: called unconditionally from
+#        fs/devpts/inode.c with its return value discarded — confirmed
+#        safe to no-op.
+#      - susfs_is_uname_spoof_buffer_set: a static_key_false the driver
+#        only uses to defensively block a redundant toolkit-apply call if
+#        spoofing is already active — not the spoofing mechanism itself,
+#        which is implemented independently in this kernel's SUSFS 2.1.0
+#        patches and already works. Default-false just means that one
+#        redundant-call guard never trips.
+#      - susfs_extra_works: a work_struct scheduled for a newer
+#        batch-SID-setting feature (susfs_set_batch_sid) that, like
+#        earlier in this build, doesn't exist in this kernel's SUSFS 2.1.0
+#        patches — no-op work function, since there's nothing on the
+#        kernel side for it to call into here.
+python3 - << 'PYEOF'
+import os
+
+# --- Fix 1: su_mount_ns.c path_mount -> do_mount compat ---
+path = "drivers/kernelsu/infra/su_mount_ns.c"
+with open(path) as f:
+    content = f.read()
+
+if "ksu_path_mount_compat" not in content:
+    inc_anchor = "#include <linux/dcache.h>"
+    assert content.count(inc_anchor) == 1
+    inc_addition = (inc_anchor
+        + "\n#include <linux/err.h> // IS_ERR, PTR_ERR"
+        + "\n#include <linux/gfp.h> // __get_free_page, GFP_KERNEL"
+        + "\n#include <linux/uaccess.h> // set_fs, get_fs, KERNEL_DS")
+    content = content.replace(inc_anchor, inc_addition, 1)
+
+    old_decl = '''extern int path_mount(const char *dev_name, struct path *path,
+                      const char *type_page, unsigned long flags,
+                      void *data_page);'''
+    assert content.count(old_decl) == 1, f"decl count: {content.count(old_decl)}"
+    new_decl = '''extern long do_mount(const char *dev_name, const char __user *dir_name,
+                     const char *type_page, unsigned long flags,
+                     void *data_page);
+
+static int ksu_path_mount_compat(struct path *path, unsigned long flags)
+{
+\tchar *buf, *root_str;
+\tmm_segment_t old_fs;
+\tint ret;
+
+\tbuf = (char *)__get_free_page(GFP_KERNEL);
+\tif (!buf)
+\t\treturn -ENOMEM;
+
+\troot_str = d_path(path, buf, PAGE_SIZE);
+\tif (IS_ERR(root_str)) {
+\t\tfree_page((unsigned long)buf);
+\t\treturn PTR_ERR(root_str);
+\t}
+
+\told_fs = get_fs();
+\tset_fs(KERNEL_DS);
+\tret = do_mount(NULL, (const char __user *)root_str, NULL, flags, NULL);
+\tset_fs(old_fs);
+
+\tfree_page((unsigned long)buf);
+\treturn ret;
+}'''
+    content = content.replace(old_decl, new_decl, 1)
+
+    old_call = "int pm_ret = path_mount(NULL, &root_path, NULL, MS_PRIVATE | MS_REC, NULL);"
+    assert content.count(old_call) == 1, f"call count: {content.count(old_call)}"
+    new_call = "int pm_ret = ksu_path_mount_compat(&root_path, MS_PRIVATE | MS_REC);"
+    content = content.replace(old_call, new_call, 1)
+
+    with open(path, "w") as f:
+        f.write(content)
+    print("Patched su_mount_ns.c: path_mount -> do_mount compat")
+else:
+    print("su_mount_ns.c already patched, skipping")
+
+# --- Fix 2: app_profile.c seccomp_filter_release -> put_seccomp_filter ---
+path = "drivers/kernelsu/policy/app_profile.c"
+with open(path) as f:
+    content = f.read()
+
+if "put_seccomp_filter" not in content:
+    old_decl = "void seccomp_filter_release(struct task_struct *tsk);"
+    assert content.count(old_decl) == 1, f"count: {content.count(old_decl)}"
+    new_decl = '''#if defined(KSU_HAS_SECCOMP_FILTER_RELEASE)
+void seccomp_filter_release(struct task_struct *tsk);
+#else
+extern void put_seccomp_filter(struct task_struct *tsk);
+#define seccomp_filter_release put_seccomp_filter
+#endif'''
+    content = content.replace(old_decl, new_decl, 1)
+    with open(path, "w") as f:
+        f.write(content)
+    print("Patched app_profile.c: seccomp_filter_release -> put_seccomp_filter")
+else:
+    print("app_profile.c already patched, skipping")
+
+# --- Fix 3: new legacy_compat.c for remaining undefined symbols ---
+legacy_path = "drivers/kernelsu/legacy_compat.c"
+if not os.path.exists(legacy_path):
+    legacy_content = '''// SPDX-License-Identifier: GPL-2.0
+#include <linux/types.h>
+#include <linux/jump_label.h>
+#include <linux/workqueue.h>
+#include <linux/fs.h>
+#include <linux/init.h>
+
+bool ksu_vfs_read_hook __read_mostly = false;
+bool ksu_execveat_hook __read_mostly = false;
+bool ksu_input_hook __read_mostly = false;
+
+int ksu_handle_devpts(struct inode *inode)
+{
+\treturn 0;
+}
+
+#if defined(CONFIG_KSU_SUSFS) && defined(CONFIG_KSU_SUSFS_SPOOF_UNAME)
+struct static_key_false susfs_is_uname_spoof_buffer_set = STATIC_KEY_FALSE_INIT;
+#endif
+
+static void susfs_extra_works_fn(struct work_struct *work) {}
+struct work_struct susfs_extra_works;
+
+static int __init ksu_legacy_compat_init(void)
+{
+\tINIT_WORK(&susfs_extra_works, susfs_extra_works_fn);
+\treturn 0;
+}
+device_initcall(ksu_legacy_compat_init);
+'''
+    with open(legacy_path, "w") as f:
+        f.write(legacy_content)
+    print("Created drivers/kernelsu/legacy_compat.c")
+
+    kbuild_path = "drivers/kernelsu/Kbuild"
+    with open(kbuild_path) as f:
+        kbuild_content = f.read()
+    marker = "kernelsu-objs := core/init.o"
+    if "legacy_compat.o" not in kbuild_content:
+        if kbuild_content.count(marker) != 1:
+            raise SystemExit(f"Kbuild: expected exactly one match for anchor, found {kbuild_content.count(marker)}")
+        kbuild_content = kbuild_content.replace(
+            marker, marker + "\nkernelsu-objs += legacy_compat.o", 1
+        )
+        with open(kbuild_path, "w") as f:
+            f.write(kbuild_content)
+        print("Registered legacy_compat.o in Kbuild")
+else:
+    print("legacy_compat.c already exists, skipping")
+
+PYEOF
+if [ $? -ne 0 ]; then
+  echo "!!! BUILD ABORTED: failed to apply link-stage compat fixes."
+  exit 1
+fi
+
 echo "-perf" > localversion
 # Build it — tee the log so we can read back Kbuild's own resolved version
 # string for the zip name, instead of hand-typing a version that can drift
