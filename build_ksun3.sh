@@ -1232,6 +1232,44 @@ if [ $? -ne 0 ]; then
   exit 1
 fi
 
+# --- Compat shim #11: supercall/supercall.c hits the exact same TWA_RESUME
+# gap as policy/allowlist.c did earlier — same root cause (task_work_add()'s
+# third parameter changed from bool to enum task_work_notify_mode around
+# 5.8/5.9, this kernel still takes bool, true is the exact equivalent). That
+# earlier fix was a #define scoped to allowlist.c's own translation unit, so
+# it doesn't reach this separate file — needs its own copy.
+# <linux/task_work.h> is already included here, so only the constant itself
+# is missing, not the function declaration.
+python3 - << 'PYEOF'
+path = "drivers/kernelsu/supercall/supercall.c"
+with open(path) as f:
+    content = f.read()
+
+if "TWA_RESUME true" in content:
+    print("supercall.c already patched, skipping")
+else:
+    anchor = "#include <linux/task_work.h>"
+    if content.count(anchor) != 1:
+        raise SystemExit(f"supercall.c: expected exactly one match for anchor include, found {content.count(anchor)}, refusing to patch blindly")
+    addition = anchor + '''
+
+#ifndef TWA_RESUME
+/* Same fix as policy/allowlist.c: TWA_RESUME (enum task_work_notify_mode)
+ * was introduced when task_work_add()'s third parameter changed from bool
+ * to that enum (~5.8/5.9). This kernel's task_work_add() still takes a
+ * plain bool, where true is the exact equivalent of TWA_RESUME. */
+#define TWA_RESUME true
+#endif'''
+    content = content.replace(anchor, addition, 1)
+    with open(path, "w") as f:
+        f.write(content)
+    print("Patched drivers/kernelsu/supercall/supercall.c with TWA_RESUME")
+PYEOF
+if [ $? -ne 0 ]; then
+  echo "!!! BUILD ABORTED: failed to patch supercall/supercall.c."
+  exit 1
+fi
+
 echo "-perf" > localversion
 # Build it — tee the log so we can read back Kbuild's own resolved version
 # string for the zip name, instead of hand-typing a version that can drift
