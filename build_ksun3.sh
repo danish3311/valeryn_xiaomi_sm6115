@@ -51,6 +51,116 @@ mv arch/arm64/configs/vendor/bengal-perf_defconfig.1 arch/arm64/configs/vendor/b
 git add arch/arm64/configs/vendor/bengal-perf_defconfig
 git cherry-pick --continue --no-edit
 
+# --- CRASH FIX: manager-open kernel panic (ksu_handle_faccessat) ---
+# Root cause, confirmed from a real device panic log:
+#   Unable to handle kernel access to user memory outside uaccess routines
+#   pc : ksu_handle_faccessat+0x1c/0xd4
+#   lr : do_faccessat+0x304/0x348
+#   Process usap64 (zygote's unspecialized app process -> fires on every app
+#   launch, including opening the manager)
+#
+# The "susfs: susfs inline hooks" cherry-pick above (5c6b9ed5, sourced from
+# JackA1ltman/NonGKI_Kernel_Build_2nd — a DIFFERENT lineage than dev-susfs's
+# own hooking mechanism) inserts, directly into fs/open.c's do_faccessat()
+# and fs/stat.c's vfs_statx():
+#   extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, ...);
+#   ...
+#   ksu_handle_faccessat(&dfd, &filename, &mode, NULL);   // raw userspace ptr
+#
+# But dev-susfs's real drivers/kernelsu/feature/sucompat.c, once
+# CONFIG_KSU_SUSFS=y (which we set), compiles a COMPLETELY DIFFERENT
+# signature for that same function name:
+#   #ifdef CONFIG_KSU_SUSFS
+#   int ksu_handle_faccessat(int *dfd, struct filename **filename, ...) {
+#       if (unlikely(IS_ERR(*filename) || (*filename)->name == NULL))  // <- expects
+#   ...                                                                //    a resolved
+#   #endif                                                             //    struct filename*,
+#                                                                       //    not a raw
+#                                                                       //    userspace ptr
+# So the call site hands it a raw userspace pointer, and the SUSFS-compiled
+# function dereferences it as an already-resolved kernel struct -> unguarded
+# userspace deref -> panic on the very first faccessat() from a freshly
+# forked process. fs/stat.c's ksu_handle_stat has the identical mismatch.
+#
+# This isn't needed anyway: dev-susfs's own tracepoint dispatcher
+# (drivers/kernelsu/hook/syscall_event_bridge.c) already calls
+# ksu_handle_faccessat_sucompat()/ksu_handle_newfstatat_sucompat(), which
+# resolve a real struct filename via getname() before calling into
+# sucompat.c correctly. Confirmed no other code path depends on the two
+# broken inline call sites, so removing them just deletes a redundant,
+# mistyped duplicate — su-path hiding keeps working via the real path.
+# fs/exec.c's inline hook (also from the same cherry-pick) is NOT touched:
+# its call site already receives an already-resolved struct filename*,
+# so its signature matches dev-susfs's expectation and is not buggy.
+python3 - << 'PYEOF'
+import re
+
+fixes = [
+    ("fs/open.c", "ksu_handle_faccessat"),
+    ("fs/stat.c", "ksu_handle_stat"),
+]
+
+for path, fn in fixes:
+    with open(path) as f:
+        content = f.read()
+
+    # Strip the mismatched extern declaration block right above the function
+    # it decorates (do_faccessat / vfs_statx), e.g.:
+    #   #ifdef CONFIG_KSU_SUSFS
+    #   extern bool ksu_su_compat_enabled __read_mostly;
+    #   extern bool __ksu_is_allow_uid_for_current(uid_t uid);
+    #   extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
+    #               int *flags);
+    #   #endif
+    extern_pattern = re.compile(
+        r"#ifdef CONFIG_KSU_SUSFS\n"
+        r"(?:.*\n)*?"
+        rf".*extern int {fn}\([^;]*\);\n"
+        r"#endif\n",
+        re.MULTILINE,
+    )
+    new_content, n_extern = extern_pattern.subn("", content, count=1)
+    if n_extern != 1:
+        print(f"WARNING: extern block for {fn} not found/removed in {path} "
+              f"(matched {n_extern} times) - upstream file may have changed, "
+              f"check manually")
+    else:
+        print(f"Removed mismatched extern for {fn} in {path}")
+    content = new_content
+
+    # Strip the actual buggy call block inside the function body, e.g.:
+    #     if (likely(susfs_is_current_proc_umounted()) || !ksu_su_compat_enabled) {
+    #         goto orig_flow;
+    #     }
+    #     if (unlikely(__ksu_is_allow_uid_for_current(current_uid().val))) {
+    #         ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+    #     }
+    # orig_flow:
+    # dev-susfs's own tracepoint dispatcher already handles su-path hiding
+    # correctly, so we just remove the whole guarded block (and the
+    # now-orphaned "#ifdef CONFIG_KSU_SUSFS" / "#endif" wrapping it).
+    call_pattern = re.compile(
+        r"[ \t]*#ifdef CONFIG_KSU_SUSFS\n"
+        r"(?:.*\n)*?"
+        rf"(?:.*\n)*?.*{fn}\([^;]*\);\n"
+        r"(?:.*\n)*?"
+        r"[ \t]*orig_flow:\n"
+        r"[ \t]*#endif\n",
+        re.MULTILINE,
+    )
+    content, n_call = call_pattern.subn("", content, count=1)
+    if n_call != 1:
+        print(f"WARNING: call block for {fn} not found/removed in {path} "
+              f"(matched {n_call} times) - check manually, panic fix may be incomplete")
+    else:
+        print(f"Removed mismatched-type {fn}() call site in {path}")
+
+    with open(path, "w") as f:
+        f.write(content)
+PYEOF
+git add fs/open.c fs/stat.c
+git commit -m "fix: remove mismatched-type ksu_handle_faccessat/stat call sites causing manager-open panic" --allow-empty
+
 # --- KernelSU-Next (SUSFS-integrated fork), latest dev-susfs ---
 # This is pershoot's own real setup.sh (not dead code): it clones
 # github.com/pershoot/KernelSU-Next, then `git checkout "$1"` — passing
