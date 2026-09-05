@@ -1190,6 +1190,48 @@ if [ $? -ne 0 ]; then
   exit 1
 fi
 
+# --- Compat shim #9: drivers/kernelsu/supercall/dispatch.c uses
+# tasklist_lock, init_task, task_pgrp(), and task_session() without
+# including the headers that declare them. Verified directly against this
+# kernel: tasklist_lock and init_task are both declared in
+# <linux/sched/task.h>, and task_pgrp()/task_session() are inline functions
+# in <linux/sched/signal.h> (both returning "struct pid *", confirmed —
+# which also explains the seventh error, "comparison between pointer and
+# integer": without a visible declaration the compiler assumed
+# task_pgrp() implicitly returned int, so the comparison against
+# init_group (a real struct pid *) mismatched. That error resolves on its
+# own once the real declaration is visible — it was never a separate bug.
+# On a newer kernel these headers are likely already pulled in transitively
+# through some other include; this kernel just needs them explicit. Placed
+# in the unconditional include block (not inside the neighboring
+# CONFIG_KSU_SUSFS block) since the function that needs them,
+# do_set_init_pgrp(), is not itself SUSFS-specific.
+python3 - << 'PYEOF'
+path = "drivers/kernelsu/supercall/dispatch.c"
+with open(path) as f:
+    content = f.read()
+
+if "tasklist_lock, init_task" in content:
+    print("dispatch.c already patched, skipping")
+else:
+    anchor = "#include <linux/utsname.h>"
+    if content.count(anchor) != 1:
+        raise SystemExit(f"dispatch.c: expected exactly one match for anchor include, found {content.count(anchor)}, refusing to patch blindly")
+    addition = (
+        anchor
+        + "\n#include <linux/sched/task.h> // tasklist_lock, init_task"
+        + "\n#include <linux/sched/signal.h> // task_pgrp, task_session"
+    )
+    content = content.replace(anchor, addition, 1)
+    with open(path, "w") as f:
+        f.write(content)
+    print("Patched drivers/kernelsu/supercall/dispatch.c with the missing sched includes")
+PYEOF
+if [ $? -ne 0 ]; then
+  echo "!!! BUILD ABORTED: failed to patch supercall/dispatch.c."
+  exit 1
+fi
+
 echo "-perf" > localversion
 # Build it — tee the log so we can read back Kbuild's own resolved version
 # string for the zip name, instead of hand-typing a version that can drift
