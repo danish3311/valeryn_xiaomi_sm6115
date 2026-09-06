@@ -51,7 +51,7 @@ mv arch/arm64/configs/vendor/bengal-perf_defconfig.1 arch/arm64/configs/vendor/b
 git add arch/arm64/configs/vendor/bengal-perf_defconfig
 git cherry-pick --continue --no-edit
 
-# --- CRITICAL RUNTIME FIX: fs/open.c's do_faccessat() calls
+# --- CRITICAL RUNTIME FIX (corrected): fs/open.c's do_faccessat() calls
 # ksu_handle_faccessat(&dfd, &filename, &mode, NULL) where filename is a
 # raw "const char __user *" — but dev-susfs's ACTUAL ksu_handle_faccessat
 # (compiled under CONFIG_KSU_SUSFS, which we require) takes
@@ -64,26 +64,37 @@ git cherry-pick --continue --no-edit
 # user memory outside uaccess routines". Confirmed via an actual pstore
 # panic log: PC was in ksu_handle_faccessat, called from do_faccessat, in
 # process usap64 during app-spawn faccessat().
-# Fix: remove this specific hook insertion entirely, restoring do_faccessat
-# to its pristine form. Confirmed this loses no functionality: dev-susfs
-# has its own separate, independent, already-working mechanism for the
-# exact same sucompat faccessat interception —
-# hook/syscall_event_bridge.c calls ksu_handle_faccessat_sucompat() via
-# dynamic syscall-table patching, entirely independent of this
-# kernel-source-level call site. Checked the other 4 files from this same
-# cherry-pick (read_write.c, exec.c, devpts/inode.c, input.c) for the same
-# bug pattern: all of them are either correctly typed already (exec.c's
-# filename is already a resolved struct filename* at that point in the
-# call chain) or gated behind our own false-by-default compat flags
-# (read_write.c, input.c) or our own correctly-typed stub (devpts) — this
-# is the only one that was both unconditionally reachable and mismatched.
+#
+# An earlier version of this fix just deleted the call entirely, on the
+# theory that dev-susfs's own hook/syscall_event_bridge.c independently
+# provides the same su-compat interception via dynamic syscall-table
+# patching. That theory was WRONG: drivers/kernelsu/Kbuild explicitly
+# excludes hook/syscall_event_bridge.o (and the whole syscall-table-patch
+# dispatcher it depends on) from the build whenever CONFIG_KSU_SUSFS=y —
+# see the Kbuild comment "Hooks (excluded for SuSFS)". Under our exact
+# Kconfig, this call site in fs/open.c is the ONLY place in the entire
+# kernel that ever invokes ksu_handle_faccessat at all — deleting it does
+# not just remove a redundant duplicate, it removes su-compat root
+# detection entirely (confirmed: this is exactly what caused root/manager
+# detection to stop working after that version shipped).
+#
+# Correct fix: keep the call, but actually give ksu_handle_faccessat what
+# it's declared to take — a resolved struct filename*, via getname() —
+# instead of the raw user pointer's address. getname()/putname() are core
+# VFS API already available in this file (fs/open.c), used exactly this
+# way by countless other syscall paths. This is a second, independent
+# getname()/putname() pair for the su-compat check alone; it doesn't
+# interfere with do_faccessat's own subsequent user_path_at() resolution
+# of the same string.
 python3 - << 'PYEOF'
 path = "fs/open.c"
 with open(path) as f:
     content = f.read()
 
-if "ksu_handle_faccessat" not in content:
-    print("fs/open.c already patched (or hook not present), skipping")
+if "ksu_faccessat_name" in content:
+    print("fs/open.c already patched, skipping")
+elif "ksu_handle_faccessat" not in content:
+    print("fs/open.c: ksu_handle_faccessat hook not present, skipping")
 else:
     old_decls = '''#ifdef CONFIG_KSU_SUSFS
 extern bool ksu_su_compat_enabled __read_mostly;
@@ -92,10 +103,19 @@ extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int
 \t\t\tint *flags);
 #endif
 long do_faccessat(int dfd, const char __user *filename, int mode)'''
-    if content.count(old_decls) != 1:
+    new_decls = '''#ifdef CONFIG_KSU_SUSFS
+extern bool ksu_su_compat_enabled __read_mostly;
+extern bool __ksu_is_allow_uid_for_current(uid_t uid);
+extern int ksu_handle_faccessat(int *dfd, struct filename **filename, int *mode,
+\t\t\tint *flags);
+#endif
+long do_faccessat(int dfd, const char __user *filename, int mode)'''
+    if content.count(old_decls) == 1:
+        content = content.replace(old_decls, new_decls, 1)
+    elif content.count(new_decls) == 1:
+        pass  # extern already corrected (e.g. re-run after partial apply)
+    else:
         raise SystemExit(f"fs/open.c: expected exactly one match for decls block, found {content.count(old_decls)}, refusing to patch blindly")
-    new_decls = '''long do_faccessat(int dfd, const char __user *filename, int mode)'''
-    content = content.replace(old_decls, new_decls, 1)
 
     old_call_block = '''#ifdef CONFIG_KSU_SUSFS
     if (likely(susfs_is_current_proc_umounted()) || !ksu_su_compat_enabled) {
@@ -111,48 +131,61 @@ orig_flow:
 \tif (mode & ~S_IRWXO)\t/* where's F_OK, X_OK, W_OK, R_OK? */'''
     if content.count(old_call_block) != 1:
         raise SystemExit(f"fs/open.c: expected exactly one match for call block, found {content.count(old_call_block)}, refusing to patch blindly")
-    new_call_block = '''\tif (mode & ~S_IRWXO)\t/* where's F_OK, X_OK, W_OK, R_OK? */'''
+    new_call_block = '''#ifdef CONFIG_KSU_SUSFS
+    if (likely(susfs_is_current_proc_umounted()) || !ksu_su_compat_enabled) {
+        goto orig_flow;
+    }
+
+    if (unlikely(__ksu_is_allow_uid_for_current(current_uid().val))) {
+        struct filename *ksu_faccessat_name = getname(filename);
+        if (!IS_ERR(ksu_faccessat_name)) {
+            ksu_handle_faccessat(&dfd, &ksu_faccessat_name, &mode, NULL);
+            putname(ksu_faccessat_name);
+        }
+    }
+
+orig_flow:
+#endif
+\tif (mode & ~S_IRWXO)\t/* where's F_OK, X_OK, W_OK, R_OK? */'''
     content = content.replace(old_call_block, new_call_block, 1)
 
     with open(path, "w") as f:
         f.write(content)
-    print("Removed the mismatched-signature ksu_handle_faccessat hook from fs/open.c")
+    print("Fixed ksu_handle_faccessat hook in fs/open.c to pass a real getname()-resolved struct filename*")
 PYEOF
 if [ $? -ne 0 ]; then
   echo "!!! BUILD ABORTED: failed to patch fs/open.c."
   exit 1
 fi
 
-# --- CRITICAL RUNTIME FIX #2: the exact same bug as fs/open.c above, one
-# function over. fs/stat.c's vfs_statx() calls
-# ksu_handle_stat(&dfd, &filename, &flags) where filename is a raw
-# "const char __user *" — but dev-susfs's ACTUAL ksu_handle_stat (also
-# compiled under CONFIG_KSU_SUSFS) takes "struct filename **" and
-# immediately dereferences it the same way ksu_handle_faccessat does,
-# expecting an already-resolved kernel object from getname(). Same
-# mismatch, same silent extern-hides-the-type-error compile, same crash
-# shape at runtime. Confirmed via a second real pstore panic log, from a
-# separate boot, after the fs/open.c fix above was already applied and
-# shipped: "Unable to handle kernel access to user memory outside uaccess
-# routines", pc: ksu_handle_stat, lr: vfs_statx, called from
-# __arm64_sys_newfstatat, in process .rifsxd.ksunext (KSU-Next's own root
-# daemon calling newfstatat() on startup) — so this isn't even
-# manager-app-specific, it fires on the first stat()/newfstatat() call
-# from any su-compat-checked process, and was always going to trigger
-# sooner or later regardless of what app is opened.
-# Fix: same as fs/open.c — remove this hook insertion entirely, restoring
-# vfs_statx to its pristine form. Same reasoning applies: dev-susfs's own
-# hook/syscall_event_bridge.c independently calls
-# ksu_handle_newfstatat_sucompat() via its dynamic syscall-table patching
-# mechanism, so nothing is lost by deleting this redundant, mistyped
-# duplicate call site.
+# --- CRITICAL RUNTIME FIX #2 (corrected): the exact same bug as fs/open.c
+# above, one function over, fixed the same corrected way. fs/stat.c's
+# vfs_statx() calls ksu_handle_stat(&dfd, &filename, &flags) where filename
+# is a raw "const char __user *" — but dev-susfs's ACTUAL ksu_handle_stat
+# (also compiled under CONFIG_KSU_SUSFS) takes "struct filename **" and
+# dereferences it the same way ksu_handle_faccessat does. Confirmed via a
+# second real pstore panic log: pc: ksu_handle_stat, lr: vfs_statx, called
+# from __arm64_sys_newfstatat, in process .rifsxd.ksunext.
+#
+# As with fs/open.c above, an earlier version of this fix deleted the call
+# entirely on the (wrong) assumption that hook/syscall_event_bridge.c
+# independently provides the same interception — it's excluded from the
+# build under CONFIG_KSU_SUSFS (see Kbuild), so this call site was the ONLY
+# place ksu_handle_stat was ever invoked, and deleting it removed su-compat
+# stat-based root detection entirely.
+#
+# Correct fix: same as fs/open.c — resolve a real struct filename* via
+# getname()/putname() instead of taking the address of the raw user
+# pointer variable.
 python3 - << 'PYEOF'
 path = "fs/stat.c"
 with open(path) as f:
     content = f.read()
 
-if "ksu_handle_stat" not in content:
-    print("fs/stat.c already patched (or hook not present), skipping")
+if "ksu_stat_name" in content:
+    print("fs/stat.c already patched, skipping")
+elif "ksu_handle_stat" not in content:
+    print("fs/stat.c: ksu_handle_stat hook not present, skipping")
 else:
     old_decls = '''#ifdef CONFIG_KSU_SUSFS
 extern bool ksu_su_compat_enabled __read_mostly;
@@ -161,10 +194,19 @@ extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *fla
 #endif
 
 int vfs_statx(int dfd, const char __user *filename, int flags,'''
-    if content.count(old_decls) != 1:
+    new_decls = '''#ifdef CONFIG_KSU_SUSFS
+extern bool ksu_su_compat_enabled __read_mostly;
+extern bool __ksu_is_allow_uid_for_current(uid_t uid);
+extern int ksu_handle_stat(int *dfd, struct filename **filename, int *flags);
+#endif
+
+int vfs_statx(int dfd, const char __user *filename, int flags,'''
+    if content.count(old_decls) == 1:
+        content = content.replace(old_decls, new_decls, 1)
+    elif content.count(new_decls) == 1:
+        pass  # extern already corrected
+    else:
         raise SystemExit(f"fs/stat.c: expected exactly one match for decls block, found {content.count(old_decls)}, refusing to patch blindly")
-    new_decls = '''int vfs_statx(int dfd, const char __user *filename, int flags,'''
-    content = content.replace(old_decls, new_decls, 1)
 
     old_call_block = '''#ifdef CONFIG_KSU_SUSFS
 \tif (likely(susfs_is_current_proc_umounted()) || !ksu_su_compat_enabled) {
@@ -179,12 +221,26 @@ orig_flow:
 \tif ((flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT |'''
     if content.count(old_call_block) != 1:
         raise SystemExit(f"fs/stat.c: expected exactly one match for call block, found {content.count(old_call_block)}, refusing to patch blindly")
-    new_call_block = '''\tif ((flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT |'''
+    new_call_block = '''#ifdef CONFIG_KSU_SUSFS
+\tif (likely(susfs_is_current_proc_umounted()) || !ksu_su_compat_enabled) {
+\t\tgoto orig_flow;
+\t}
+\tif (unlikely(__ksu_is_allow_uid_for_current(current_uid().val))) {
+\t\tstruct filename *ksu_stat_name = getname(filename);
+\t\tif (!IS_ERR(ksu_stat_name)) {
+\t\t\tksu_handle_stat(&dfd, &ksu_stat_name, &flags);
+\t\t\tputname(ksu_stat_name);
+\t\t}
+\t}
+orig_flow:
+#endif
+
+\tif ((flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT |'''
     content = content.replace(old_call_block, new_call_block, 1)
 
     with open(path, "w") as f:
         f.write(content)
-    print("Removed the mismatched-signature ksu_handle_stat hook from fs/stat.c")
+    print("Fixed ksu_handle_stat hook in fs/stat.c to pass a real getname()-resolved struct filename*")
 PYEOF
 if [ $? -ne 0 ]; then
   echo "!!! BUILD ABORTED: failed to patch fs/stat.c."
@@ -247,93 +303,25 @@ echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> arch/arm64/configs/vendor/bengal-perf_defco
 # exists on dev-susfs; setting it would just be a harmless dead line, but
 # there's no reason to carry it forward.)
 
-# --- CRITICAL RUNTIME FIX #3: root/su detection completely dead under our
-# exact Kconfig combination (CONFIG_KSU_SUSFS=y + CONFIG_KPROBES=y +
-# CONFIG_HAVE_SYSCALL_TRACEPOINTS=y). Not a crash — root just silently never
-# activates, which is why the fs/open.c and fs/stat.c fixes above stopped
-# the panics but the manager still shows "not detected".
-#
-# Root cause, traced through drivers/kernelsu/core/init.c: EVERY call site
-# that actually installs a syscall hook is gated
-# "#if !defined(CONFIG_KSU_SUSFS) && defined(CONFIG_KPROBES)":
-#   - ksu_syscall_hook_init() (hook/arm64/syscall_hook.c) resolves
-#     sys_call_table and physically patches one ni_syscall slot to install
-#     the dispatcher. Never called under SUSFS -> sys_call_table is never
-#     even resolved, ksu_dispatcher_nr stays unset.
-#   - ksu_syscall_hook_manager_init() (hook/syscall_hook_manager.c)
-#     registers the actual per-syscall hooks (setresuid/execve/execveat/
-#     newfstatat/faccessat) AND the sys_enter tracepoint that redirects
-#     matched syscalls into the dispatcher. Also never called under SUSFS.
-#
-# Under CONFIG_KSU_SUSFS, init.c instead directly calls ksu_sucompat_init()
-# (feature/sucompat.c) expecting it to be the SUSFS-native replacement —
-# but verified directly: it does nothing but
-# ksu_register_feature_handler(&su_compat_handler), registering itself in
-# an internal feature registry. It installs no hook of its own. The actual
-# ksu_handle_*_sucompat() functions it registers are only ever invoked via
-# hook/syscall_event_bridge.c, which is only ever reached through the same
-# sys_enter tracepoint dispatch that ksu_syscall_hook_manager_init() sets
-# up — the exact function this Kconfig combination skips. So with SUSFS on,
-# nothing ever routes a real syscall to su-compat at all: the driver loads,
-# ksu_sucompat_init() registers a handler nothing will ever call, and root
-# never activates. No crash, because nothing ever executes the broken path
-# either — it just silently no-ops forever.
-#
-# This also explains why ksu_syscall_hook_manager_init() itself ends by
-# calling ksu_setuid_hook_init()/ksu_sucompat_init()/ksu_avc_spoof_init() —
-# under the working (non-SUSFS) config, THAT'S where they're meant to be
-# called from, once the dispatcher they depend on is actually wired up.
-# init.c's separate, unconditional call to those same three functions under
-# "#ifdef CONFIG_KSU_SUSFS" only exists because dev-susfs's SUSFS path
-# skips the function that would otherwise call them itself.
-#
-# Fix: make ksu_syscall_hook_init() and both
-# ksu_syscall_hook_manager_init() call sites unconditional on CONFIG_KPROBES
-# (drop the "!defined(CONFIG_KSU_SUSFS) &&"), matching how the non-SUSFS
-# path already works and is presumably tested. Remove the now-redundant
-# direct calls to ksu_setuid_hook_init()/ksu_sucompat_init()/
-# ksu_avc_spoof_init() under "#ifdef CONFIG_KSU_SUSFS", since
-# ksu_syscall_hook_manager_init() already calls all three at the end of its
-# own init — leaving both in place would call each of them twice on every
-# boot (once directly, once via hook_manager_init), which is exactly the
-# kind of double-registration risk (double list insertion into the feature
-# handler registry, double kprobe/tracepoint registration) worth avoiding
-# rather than assuming is harmless.
-python3 - << 'PYEOF'
-path = "drivers/kernelsu/core/init.c"
-with open(path) as f:
-    content = f.read()
-
-if "#if defined(CONFIG_KPROBES)\n\tksu_syscall_hook_init();" in content:
-    print("init.c already patched, skipping")
-else:
-    block1_old = "#if !defined(CONFIG_KSU_SUSFS) && defined(CONFIG_KPROBES)\n\tksu_syscall_hook_init();\n#endif"
-    block1_new = "#if defined(CONFIG_KPROBES)\n\tksu_syscall_hook_init();\n#endif"
-    if content.count(block1_old) != 1:
-        raise SystemExit(f"init.c: expected exactly one match for ksu_syscall_hook_init guard, found {content.count(block1_old)}, refusing to patch blindly")
-    content = content.replace(block1_old, block1_new, 1)
-
-    block2_old = "#ifdef CONFIG_KSU_SUSFS\n\tksu_sucompat_init();\n\tksu_setuid_hook_init();\n\tksu_avc_spoof_init();\n#endif\n\n\tif (ksu_late_loaded) {"
-    block2_new = "\tif (ksu_late_loaded) {"
-    if content.count(block2_old) != 1:
-        raise SystemExit(f"init.c: expected exactly one match for the redundant direct sucompat/setuid/avc_spoof init block, found {content.count(block2_old)}, refusing to patch blindly")
-    content = content.replace(block2_old, block2_new, 1)
-
-    block3_old = "#if !defined(CONFIG_KSU_SUSFS) && defined(CONFIG_KPROBES)\n\t\tksu_syscall_hook_manager_init();\n#endif"
-    block3_new = "#if defined(CONFIG_KPROBES)\n\t\tksu_syscall_hook_manager_init();\n#endif"
-    n = content.count(block3_old)
-    if n != 2:
-        raise SystemExit(f"init.c: expected exactly two matches for ksu_syscall_hook_manager_init guard (late_loaded + else branch), found {n}, refusing to patch blindly")
-    content = content.replace(block3_old, block3_new)
-
-    with open(path, "w") as f:
-        f.write(content)
-    print("Patched drivers/kernelsu/core/init.c: syscall hook installation is no longer skipped under CONFIG_KSU_SUSFS")
-PYEOF
-if [ $? -ne 0 ]; then
-  echo "!!! BUILD ABORTED: failed to patch drivers/kernelsu/core/init.c."
-  exit 1
-fi
+# --- NOTE, superseded/reverted: an earlier version of this script patched
+# drivers/kernelsu/core/init.c to call ksu_syscall_hook_init() and
+# ksu_syscall_hook_manager_init() unconditionally, based on a theory that
+# root was dead under CONFIG_KSU_SUSFS because those two functions were
+# skipped. That theory was WRONG and the patch broke the link entirely:
+#   ld.lld: error: undefined symbol: ksu_syscall_hook_init
+#   ld.lld: error: undefined symbol: ksu_syscall_hook_manager_init
+# Root cause of THAT failure: drivers/kernelsu/Kbuild deliberately excludes
+# hook/syscall_event_bridge.o, hook/syscall_hook_manager.o, hook/tp_marker.o
+# and hook/arm64/syscall_hook.o from the build entirely under
+# CONFIG_KSU_SUSFS (comment in Kbuild literally says "Hooks (excluded for
+# SuSFS)"). So those functions aren't just unreachable under SUSFS — they
+# don't exist in the compiled objects at all, and calling them unconditionally
+# is an undefined-symbol link error, not a runtime no-op. Confirmed by
+# reading drivers/kernelsu/Kbuild directly. The real, intended SUSFS-mode
+# hook path is hook/lsm_hook.o (LSM-based hooks, unconditionally compiled
+# whenever CONFIG_KPROBES=y regardless of SUSFS) plus the kernel-side
+# call sites inserted directly into fs/open.c/fs/stat.c/etc — which is
+# exactly what the two fixes below correct properly instead of removing.
 
 # --- Compat shim: drivers/kernelsu/feature/sucompat.c does
 #   #ifdef CONFIG_KSU_SUSFS
