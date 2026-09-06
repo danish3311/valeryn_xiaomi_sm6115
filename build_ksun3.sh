@@ -123,32 +123,35 @@ if [ $? -ne 0 ]; then
   exit 1
 fi
 
-# --- CRITICAL RUNTIME FIX #2: the identical bug in fs/stat.c, confirmed by
-# a second pstore panic log (Process .rifsxd.ksunext, pc: ksu_handle_stat,
-# called from vfs_statx <- __arm64_sys_newfstatat). Same exact root cause
-# as the faccessat fix above: fs/stat.c calls
-# ksu_handle_stat(&dfd, &filename, &flags) with a raw
-# "const char __user *filename", but dev-susfs's CONFIG_KSU_SUSFS
-# implementation takes "struct filename **" and dereferences it as
-# (*filename)->name -- verified directly in kernel/feature/sucompat.c.
-# Same fix: remove the hook entirely. Confirmed safe the same way --
-# dev-susfs has its own independent, already-working mechanism
-# (ksu_handle_stat_sucompat, called from hook/syscall_event_bridge.c via
-# dynamic syscall-table patching) providing the exact same functionality.
-# Also swept the entire kernel-side patched tree for every other
-# ksu_handle_* call site after this one: ksu_handle_execveat(_sucompat) in
-# fs/exec.c is correctly typed (filename is already a resolved
-# struct filename* at that call site, unlike stat.c/open.c's raw user
-# pointer), and ksu_handle_sys_read/ksu_handle_input_handle_event/
-# ksu_handle_devpts are all safely gated behind our own false-by-default
-# compat flags or our own correctly-typed stub. These two were the only
-# unconditionally-reachable, mismatched call sites in the whole tree.
+# --- CRITICAL RUNTIME FIX #2: the exact same bug as fs/open.c above, one
+# function over. fs/stat.c's vfs_statx() calls
+# ksu_handle_stat(&dfd, &filename, &flags) where filename is a raw
+# "const char __user *" — but dev-susfs's ACTUAL ksu_handle_stat (also
+# compiled under CONFIG_KSU_SUSFS) takes "struct filename **" and
+# immediately dereferences it the same way ksu_handle_faccessat does,
+# expecting an already-resolved kernel object from getname(). Same
+# mismatch, same silent extern-hides-the-type-error compile, same crash
+# shape at runtime. Confirmed via a second real pstore panic log, from a
+# separate boot, after the fs/open.c fix above was already applied and
+# shipped: "Unable to handle kernel access to user memory outside uaccess
+# routines", pc: ksu_handle_stat, lr: vfs_statx, called from
+# __arm64_sys_newfstatat, in process .rifsxd.ksunext (KSU-Next's own root
+# daemon calling newfstatat() on startup) — so this isn't even
+# manager-app-specific, it fires on the first stat()/newfstatat() call
+# from any su-compat-checked process, and was always going to trigger
+# sooner or later regardless of what app is opened.
+# Fix: same as fs/open.c — remove this hook insertion entirely, restoring
+# vfs_statx to its pristine form. Same reasoning applies: dev-susfs's own
+# hook/syscall_event_bridge.c independently calls
+# ksu_handle_newfstatat_sucompat() via its dynamic syscall-table patching
+# mechanism, so nothing is lost by deleting this redundant, mistyped
+# duplicate call site.
 python3 - << 'PYEOF'
 path = "fs/stat.c"
 with open(path) as f:
     content = f.read()
 
-if "ksu_handle_stat(" not in content:
+if "ksu_handle_stat" not in content:
     print("fs/stat.c already patched (or hook not present), skipping")
 else:
     old_decls = '''#ifdef CONFIG_KSU_SUSFS
@@ -1404,6 +1407,49 @@ else:
 PYEOF
 if [ $? -ne 0 ]; then
   echo "!!! BUILD ABORTED: failed to patch supercall/supercall.c."
+  exit 1
+fi
+
+# --- Compat shim #11b: identical TWA_RESUME gap, third file. dev-susfs is
+# rolling/nightly (per the note at the top of this script) — this call
+# didn't exist in feature/sucompat.c as of the previous build, and was
+# added upstream since (install_su_fd's task_work_add call, for deferred
+# su-fd installation on return to userspace). Same root cause, same fix as
+# allowlist.c and supercall.c: this kernel's task_work_add() still takes a
+# plain bool third parameter, and true is the exact equivalent of
+# TWA_RESUME. sucompat.c already includes <linux/task_work.h> (confirmed),
+# so again only the constant itself is missing, not the function
+# declaration.
+python3 - << 'PYEOF'
+path = "drivers/kernelsu/feature/sucompat.c"
+with open(path) as f:
+    content = f.read()
+
+if "TWA_RESUME true" in content:
+    print("sucompat.c already patched, skipping")
+elif "TWA_RESUME" not in content:
+    print("sucompat.c does not reference TWA_RESUME, skipping")
+else:
+    anchor = "#include <linux/task_work.h>"
+    if content.count(anchor) != 1:
+        raise SystemExit(f"sucompat.c: expected exactly one match for anchor include, found {content.count(anchor)}, refusing to patch blindly")
+    addition = anchor + '''
+
+#ifndef TWA_RESUME
+/* Same fix as policy/allowlist.c and supercall/supercall.c: TWA_RESUME
+ * (enum task_work_notify_mode) was introduced when task_work_add()'s third
+ * parameter changed from bool to that enum (~5.8/5.9). This kernel's
+ * task_work_add() still takes a plain bool, where true is the exact
+ * equivalent of TWA_RESUME. */
+#define TWA_RESUME true
+#endif'''
+    content = content.replace(anchor, addition, 1)
+    with open(path, "w") as f:
+        f.write(content)
+    print("Patched drivers/kernelsu/feature/sucompat.c with TWA_RESUME")
+PYEOF
+if [ $? -ne 0 ]; then
+  echo "!!! BUILD ABORTED: failed to patch feature/sucompat.c."
   exit 1
 fi
 
