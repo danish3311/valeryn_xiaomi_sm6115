@@ -123,6 +123,71 @@ if [ $? -ne 0 ]; then
   exit 1
 fi
 
+# --- CRITICAL RUNTIME FIX #2: the identical bug in fs/stat.c, confirmed by
+# a second pstore panic log (Process .rifsxd.ksunext, pc: ksu_handle_stat,
+# called from vfs_statx <- __arm64_sys_newfstatat). Same exact root cause
+# as the faccessat fix above: fs/stat.c calls
+# ksu_handle_stat(&dfd, &filename, &flags) with a raw
+# "const char __user *filename", but dev-susfs's CONFIG_KSU_SUSFS
+# implementation takes "struct filename **" and dereferences it as
+# (*filename)->name -- verified directly in kernel/feature/sucompat.c.
+# Same fix: remove the hook entirely. Confirmed safe the same way --
+# dev-susfs has its own independent, already-working mechanism
+# (ksu_handle_stat_sucompat, called from hook/syscall_event_bridge.c via
+# dynamic syscall-table patching) providing the exact same functionality.
+# Also swept the entire kernel-side patched tree for every other
+# ksu_handle_* call site after this one: ksu_handle_execveat(_sucompat) in
+# fs/exec.c is correctly typed (filename is already a resolved
+# struct filename* at that call site, unlike stat.c/open.c's raw user
+# pointer), and ksu_handle_sys_read/ksu_handle_input_handle_event/
+# ksu_handle_devpts are all safely gated behind our own false-by-default
+# compat flags or our own correctly-typed stub. These two were the only
+# unconditionally-reachable, mismatched call sites in the whole tree.
+python3 - << 'PYEOF'
+path = "fs/stat.c"
+with open(path) as f:
+    content = f.read()
+
+if "ksu_handle_stat(" not in content:
+    print("fs/stat.c already patched (or hook not present), skipping")
+else:
+    old_decls = '''#ifdef CONFIG_KSU_SUSFS
+extern bool ksu_su_compat_enabled __read_mostly;
+extern bool __ksu_is_allow_uid_for_current(uid_t uid);
+extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
+#endif
+
+int vfs_statx(int dfd, const char __user *filename, int flags,'''
+    if content.count(old_decls) != 1:
+        raise SystemExit(f"fs/stat.c: expected exactly one match for decls block, found {content.count(old_decls)}, refusing to patch blindly")
+    new_decls = '''int vfs_statx(int dfd, const char __user *filename, int flags,'''
+    content = content.replace(old_decls, new_decls, 1)
+
+    old_call_block = '''#ifdef CONFIG_KSU_SUSFS
+\tif (likely(susfs_is_current_proc_umounted()) || !ksu_su_compat_enabled) {
+\t\tgoto orig_flow;
+\t}
+\tif (unlikely(__ksu_is_allow_uid_for_current(current_uid().val))) {
+\t\tksu_handle_stat(&dfd, &filename, &flags);
+\t}
+orig_flow:
+#endif
+
+\tif ((flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT |'''
+    if content.count(old_call_block) != 1:
+        raise SystemExit(f"fs/stat.c: expected exactly one match for call block, found {content.count(old_call_block)}, refusing to patch blindly")
+    new_call_block = '''\tif ((flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT |'''
+    content = content.replace(old_call_block, new_call_block, 1)
+
+    with open(path, "w") as f:
+        f.write(content)
+    print("Removed the mismatched-signature ksu_handle_stat hook from fs/stat.c")
+PYEOF
+if [ $? -ne 0 ]; then
+  echo "!!! BUILD ABORTED: failed to patch fs/stat.c."
+  exit 1
+fi
+
 # --- KernelSU-Next (SUSFS-integrated fork), latest dev-susfs ---
 # This is pershoot's own real setup.sh (not dead code): it clones
 # github.com/pershoot/KernelSU-Next, then `git checkout "$1"` — passing
