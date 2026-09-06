@@ -247,6 +247,94 @@ echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> arch/arm64/configs/vendor/bengal-perf_defco
 # exists on dev-susfs; setting it would just be a harmless dead line, but
 # there's no reason to carry it forward.)
 
+# --- CRITICAL RUNTIME FIX #3: root/su detection completely dead under our
+# exact Kconfig combination (CONFIG_KSU_SUSFS=y + CONFIG_KPROBES=y +
+# CONFIG_HAVE_SYSCALL_TRACEPOINTS=y). Not a crash — root just silently never
+# activates, which is why the fs/open.c and fs/stat.c fixes above stopped
+# the panics but the manager still shows "not detected".
+#
+# Root cause, traced through drivers/kernelsu/core/init.c: EVERY call site
+# that actually installs a syscall hook is gated
+# "#if !defined(CONFIG_KSU_SUSFS) && defined(CONFIG_KPROBES)":
+#   - ksu_syscall_hook_init() (hook/arm64/syscall_hook.c) resolves
+#     sys_call_table and physically patches one ni_syscall slot to install
+#     the dispatcher. Never called under SUSFS -> sys_call_table is never
+#     even resolved, ksu_dispatcher_nr stays unset.
+#   - ksu_syscall_hook_manager_init() (hook/syscall_hook_manager.c)
+#     registers the actual per-syscall hooks (setresuid/execve/execveat/
+#     newfstatat/faccessat) AND the sys_enter tracepoint that redirects
+#     matched syscalls into the dispatcher. Also never called under SUSFS.
+#
+# Under CONFIG_KSU_SUSFS, init.c instead directly calls ksu_sucompat_init()
+# (feature/sucompat.c) expecting it to be the SUSFS-native replacement —
+# but verified directly: it does nothing but
+# ksu_register_feature_handler(&su_compat_handler), registering itself in
+# an internal feature registry. It installs no hook of its own. The actual
+# ksu_handle_*_sucompat() functions it registers are only ever invoked via
+# hook/syscall_event_bridge.c, which is only ever reached through the same
+# sys_enter tracepoint dispatch that ksu_syscall_hook_manager_init() sets
+# up — the exact function this Kconfig combination skips. So with SUSFS on,
+# nothing ever routes a real syscall to su-compat at all: the driver loads,
+# ksu_sucompat_init() registers a handler nothing will ever call, and root
+# never activates. No crash, because nothing ever executes the broken path
+# either — it just silently no-ops forever.
+#
+# This also explains why ksu_syscall_hook_manager_init() itself ends by
+# calling ksu_setuid_hook_init()/ksu_sucompat_init()/ksu_avc_spoof_init() —
+# under the working (non-SUSFS) config, THAT'S where they're meant to be
+# called from, once the dispatcher they depend on is actually wired up.
+# init.c's separate, unconditional call to those same three functions under
+# "#ifdef CONFIG_KSU_SUSFS" only exists because dev-susfs's SUSFS path
+# skips the function that would otherwise call them itself.
+#
+# Fix: make ksu_syscall_hook_init() and both
+# ksu_syscall_hook_manager_init() call sites unconditional on CONFIG_KPROBES
+# (drop the "!defined(CONFIG_KSU_SUSFS) &&"), matching how the non-SUSFS
+# path already works and is presumably tested. Remove the now-redundant
+# direct calls to ksu_setuid_hook_init()/ksu_sucompat_init()/
+# ksu_avc_spoof_init() under "#ifdef CONFIG_KSU_SUSFS", since
+# ksu_syscall_hook_manager_init() already calls all three at the end of its
+# own init — leaving both in place would call each of them twice on every
+# boot (once directly, once via hook_manager_init), which is exactly the
+# kind of double-registration risk (double list insertion into the feature
+# handler registry, double kprobe/tracepoint registration) worth avoiding
+# rather than assuming is harmless.
+python3 - << 'PYEOF'
+path = "drivers/kernelsu/core/init.c"
+with open(path) as f:
+    content = f.read()
+
+if "#if defined(CONFIG_KPROBES)\n\tksu_syscall_hook_init();" in content:
+    print("init.c already patched, skipping")
+else:
+    block1_old = "#if !defined(CONFIG_KSU_SUSFS) && defined(CONFIG_KPROBES)\n\tksu_syscall_hook_init();\n#endif"
+    block1_new = "#if defined(CONFIG_KPROBES)\n\tksu_syscall_hook_init();\n#endif"
+    if content.count(block1_old) != 1:
+        raise SystemExit(f"init.c: expected exactly one match for ksu_syscall_hook_init guard, found {content.count(block1_old)}, refusing to patch blindly")
+    content = content.replace(block1_old, block1_new, 1)
+
+    block2_old = "#ifdef CONFIG_KSU_SUSFS\n\tksu_sucompat_init();\n\tksu_setuid_hook_init();\n\tksu_avc_spoof_init();\n#endif\n\n\tif (ksu_late_loaded) {"
+    block2_new = "\tif (ksu_late_loaded) {"
+    if content.count(block2_old) != 1:
+        raise SystemExit(f"init.c: expected exactly one match for the redundant direct sucompat/setuid/avc_spoof init block, found {content.count(block2_old)}, refusing to patch blindly")
+    content = content.replace(block2_old, block2_new, 1)
+
+    block3_old = "#if !defined(CONFIG_KSU_SUSFS) && defined(CONFIG_KPROBES)\n\t\tksu_syscall_hook_manager_init();\n#endif"
+    block3_new = "#if defined(CONFIG_KPROBES)\n\t\tksu_syscall_hook_manager_init();\n#endif"
+    n = content.count(block3_old)
+    if n != 2:
+        raise SystemExit(f"init.c: expected exactly two matches for ksu_syscall_hook_manager_init guard (late_loaded + else branch), found {n}, refusing to patch blindly")
+    content = content.replace(block3_old, block3_new)
+
+    with open(path, "w") as f:
+        f.write(content)
+    print("Patched drivers/kernelsu/core/init.c: syscall hook installation is no longer skipped under CONFIG_KSU_SUSFS")
+PYEOF
+if [ $? -ne 0 ]; then
+  echo "!!! BUILD ABORTED: failed to patch drivers/kernelsu/core/init.c."
+  exit 1
+fi
+
 # --- Compat shim: drivers/kernelsu/feature/sucompat.c does
 #   #ifdef CONFIG_KSU_SUSFS
 #   #include <linux/minmax.h>
